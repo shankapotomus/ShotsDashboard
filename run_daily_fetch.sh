@@ -53,6 +53,24 @@ fi
 # --- Run ---------------------------------------------------------------------
 echo "$(date '+%Y-%m-%d %H:%M:%S')  INFO   Starting daily fetch" | tee -a "$LOG_FILE"
 
+# Disable errexit around the python run so we can capture its exit code.
+# daily_fetch.py exits 0 = success, 1 = fatal error, 2 = incomplete run.
+set +e
 python "$SCRIPT_DIR/daily_fetch.py" "$@" 2>&1 | tee -a "$LOG_FILE"
+FETCH_EXIT=${PIPESTATUS[0]}
+set -e
 
-echo "$(date '+%Y-%m-%d %H:%M:%S')  INFO   Finished daily fetch" | tee -a "$LOG_FILE"
+echo "$(date '+%Y-%m-%d %H:%M:%S')  INFO   Finished daily fetch (exit $FETCH_EXIT)" | tee -a "$LOG_FILE"
+
+# --- Commit and push new CSV files to GitHub ---------------------------------
+git -C "$SCRIPT_DIR" add cbbd_data/ 2>/dev/null || true
+if ! git -C "$SCRIPT_DIR" diff --cached --quiet 2>/dev/null; then
+    DATE_LABEL=$(date +%Y-%m-%d)
+    git -C "$SCRIPT_DIR" commit -m "data: fetch results for $DATE_LABEL" 2>&1 | tee -a "$LOG_FILE"
+    git -C "$SCRIPT_DIR" push origin HEAD 2>&1 | tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S')  INFO   Pushed data to GitHub" | tee -a "$LOG_FILE"
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S')  INFO   No new data files to commit" | tee -a "$LOG_FILE"
+fi
+
+exit $FETCH_EXIT

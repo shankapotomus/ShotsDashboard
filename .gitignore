@@ -4,9 +4,6 @@
 # Log files
 logs/
 
-# Output data
-cbbd_data/
-
 # Python
 __pycache__/
 *.pyc
