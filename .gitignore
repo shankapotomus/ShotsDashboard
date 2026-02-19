@@ -1,0 +1,18 @@
+# API credentials
+.env
+
+# Log files
+logs/
+
+# Output data
+cbbd_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
