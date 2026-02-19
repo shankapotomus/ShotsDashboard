@@ -22,6 +22,12 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+try:
+    from zoneinfo import ZoneInfo
+    _EASTERN = ZoneInfo("America/New_York")
+except ImportError:
+    _EASTERN = None  # Python < 3.9; falls back to system timezone
+
 import cbbd
 import numpy as np
 import pandas as pd
@@ -669,6 +675,75 @@ def process_single_game(game_id, game_df, configuration, season):
 
 
 # ---------------------------------------------------------------------------
+# Completeness check
+# ---------------------------------------------------------------------------
+def check_completeness(games_df, plays_df, failed_games):
+    """
+    Compare every game the API returned for the day against what was actually
+    fetched and processed.
+
+    Returns a dict with:
+        expected_count   – games returned by get_games()
+        pbp_fetched_count – games that had PBP data returned
+        processed_count  – games that completed the full analysis pipeline
+        failed_count     – games that failed at the analysis stage
+        missing_pbp      – list of game IDs with no PBP data
+        failed_analysis  – list of game IDs that errored during analysis
+        is_complete      – True only when every expected game was fully processed
+    """
+    expected_ids = (
+        set(games_df["id"].astype(str).tolist()) if not games_df.empty else set()
+    )
+    pbp_ids = (
+        set(plays_df["gameId"].astype(str).tolist()) if not plays_df.empty else set()
+    )
+    failed_ids = {str(fg["gameId"]) for fg in failed_games}
+    processed_ids = pbp_ids - failed_ids
+
+    missing_pbp = expected_ids - pbp_ids
+    failed_analysis = expected_ids & failed_ids
+    is_complete = not missing_pbp and not failed_analysis
+
+    report = {
+        "expected_count": len(expected_ids),
+        "pbp_fetched_count": len(pbp_ids),
+        "processed_count": len(processed_ids),
+        "failed_count": len(failed_ids),
+        "missing_pbp": sorted(missing_pbp),
+        "failed_analysis": sorted(failed_analysis),
+        "is_complete": is_complete,
+    }
+
+    log.info("=== Completeness Check ===")
+    log.info("  Expected games   : %d", report["expected_count"])
+    log.info("  PBP fetched      : %d", report["pbp_fetched_count"])
+    log.info("  Fully processed  : %d", report["processed_count"])
+    log.info("  Failed           : %d", report["failed_count"])
+    if missing_pbp:
+        log.warning(
+            "  Missing PBP (%d) : %s",
+            len(missing_pbp),
+            ", ".join(sorted(missing_pbp)),
+        )
+    if failed_analysis:
+        log.warning(
+            "  Failed analysis (%d): %s",
+            len(failed_analysis),
+            ", ".join(sorted(failed_analysis)),
+        )
+    if is_complete:
+        log.info("  Status: COMPLETE — all %d games processed.", len(expected_ids))
+    else:
+        log.warning(
+            "  Status: INCOMPLETE — %d/%d games fully processed.",
+            len(processed_ids),
+            len(expected_ids),
+        )
+    log.info("==========================")
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def run_pipeline(target_date: datetime, configuration, season: int):
@@ -688,7 +763,7 @@ def run_pipeline(target_date: datetime, configuration, season: int):
 
     if games_df.empty:
         log.info("No games found for %s — nothing to do.", target_date.date())
-        return
+        return None
 
     log.info("Found %d games", len(games_df))
 
@@ -790,6 +865,8 @@ def run_pipeline(target_date: datetime, configuration, season: int):
         for fg in failed_games:
             log.warning("  Failed game %s: %s", fg["gameId"], fg["error"])
 
+    return check_completeness(games_df, plays_df, failed_games)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -815,14 +892,29 @@ def main():
             log.error("Invalid date format '%s'. Use YYYY-MM-DD.", args.date)
             sys.exit(1)
     else:
-        target_date = datetime.now() - timedelta(days=1)
+        # Compute "yesterday" in Eastern Time so the correct calendar day is
+        # used regardless of the server's local timezone.
+        if _EASTERN is not None:
+            now_et = datetime.now(tz=_EASTERN)
+        else:
+            # Fallback: assume server is already in EST/EDT, or close enough.
+            now_et = datetime.now()
+        yesterday_et = now_et - timedelta(days=1)
+        target_date = yesterday_et.replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        )
 
     configuration = cbbd.Configuration(
         host="https://api.collegebasketballdata.com",
         access_token=api_key,
     )
 
-    run_pipeline(target_date, configuration, SEASON)
+    report = run_pipeline(target_date, configuration, SEASON)
+
+    # Exit with a non-zero code when the run was incomplete so that cron /
+    # monitoring systems can detect the failure automatically.
+    if report is not None and not report["is_complete"]:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

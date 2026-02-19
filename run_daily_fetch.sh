@@ -3,11 +3,23 @@
 # ------------------
 # Shell wrapper for daily_fetch.py, intended to be called by cron.
 #
-# Cron setup (run at 6 AM every day):
+# Cron setup (run at 6 AM Eastern Time every day):
 #   crontab -e
-#   0 6 * * * /path/to/ShotsDashboard/run_daily_fetch.sh
+#
+#   Add the TZ line once at the top of your crontab to make cron
+#   interpret all schedules in Eastern Time:
+#
+#     TZ=America/New_York
+#     0 6 * * * /path/to/ShotsDashboard/run_daily_fetch.sh
+#
+#   The TZ setting handles both EST (UTC-5) and EDT (UTC-4)
+#   automatically, so the job always fires at 6 AM local Eastern Time.
+#
+#   daily_fetch.py also computes "yesterday" in Eastern Time internally,
+#   so the correct game-day is always fetched regardless of server timezone.
 #
 # The script logs output to logs/daily_fetch_YYYYMMDD.log.
+# Exit code 2 means the run completed but some games were missing/failed.
 
 set -euo pipefail
 
