@@ -196,8 +196,16 @@ def get_lineup_stints(pbp_df):
 # Last free-throw detection
 # ---------------------------------------------------------------------------
 def _precompute_last_ft_flags(game_df):
+    """Pre-compute which MadeFreeThrow rows are the last FT in a sequence.
+
+    NEW format: has 'M of N' pattern — last when M == N (e.g. '2 of 2').
+    OLD format: no 'M of N'; detect last FT by checking whether the next
+                play is also a MadeFreeThrow at the same clock time.
+
+    Uses 'id' as sort tiebreaker for stable ordering at the same clock.
+    """
     sorted_df = game_df.sort_values(
-        ["period", "secondsRemaining"], ascending=[True, False]
+        ["period", "secondsRemaining", "id"], ascending=[True, False, True]
     ).reset_index()
     is_last_ft = {}
     ft_mask = sorted_df["playType"] == "MadeFreeThrow"
@@ -207,9 +215,15 @@ def _precompute_last_ft_flags(game_df):
         row = sorted_df.iloc[pos]
         txt_lower = _safe_txt(row["playText"])
         orig_idx = row["index"]
-        if any(f"{n} of {n}" in txt_lower for n in ("1", "2", "3")):
-            is_last_ft[orig_idx] = True
+
+        # New format: use regex to extract M and N from "M of N"
+        m_of_n = re.search(r"(\d+)\s+of\s+(\d+)", txt_lower)
+        if m_of_n:
+            m_val, n_val = int(m_of_n.group(1)), int(m_of_n.group(2))
+            is_last_ft[orig_idx] = (m_val == n_val)
             continue
+
+        # Old format: check if the NEXT row is also a FT at the same clock
         if pos + 1 < len(sorted_df):
             next_row = sorted_df.iloc[pos + 1]
             same_clock = (
@@ -224,11 +238,121 @@ def _precompute_last_ft_flags(game_df):
 
 
 # ---------------------------------------------------------------------------
+# Technical foul free-throw detection
+# ---------------------------------------------------------------------------
+def _precompute_tech_ft_flags(game_df):
+    """Pre-compute which MadeFreeThrow rows follow a Technical Foul.
+
+    Technical FTs don't change possession — the fouled team shoots then
+    retains the ball. Detected by finding a TechnicalFoul play immediately
+    preceding the FT at the same clock time.
+
+    Returns dict: original_index -> bool (True = this is a tech FT).
+    """
+    sorted_df = game_df.sort_values(
+        ["period", "secondsRemaining", "id"], ascending=[True, False, True]
+    ).reset_index()
+    is_tech_ft = {}
+
+    ft_mask = sorted_df["playType"] == "MadeFreeThrow"
+    ft_indices = sorted_df.index[ft_mask].tolist()
+
+    for pos in ft_indices:
+        row = sorted_df.iloc[pos]
+        orig_idx = row["index"]
+
+        found_tech = False
+        for back in range(pos - 1, max(pos - 6, -1), -1):
+            prev = sorted_df.iloc[back]
+            if prev["period"] != row["period"]:
+                break
+            if prev["secondsRemaining"] != row["secondsRemaining"]:
+                break
+            if "Technical" in _safe_str(prev.get("playType", "")):
+                found_tech = True
+                break
+            if prev["playType"] in ("MadeFreeThrow", "PersonalFoul"):
+                continue
+            break
+
+        is_tech_ft[orig_idx] = found_tech
+
+    return is_tech_ft
+
+
+# ---------------------------------------------------------------------------
+# Dead Ball Rebound classification
+# ---------------------------------------------------------------------------
+def _classify_dead_ball_rebounds(game_df, last_ft_flags):
+    """Classify each Dead Ball Rebound to determine whether it ends possession.
+
+    Categories:
+      'mid_ft_sequence'    — between FTs of a multi-FT trip -> don't end possession
+      'after_made_last_ft' — after a made last FT -> don't end (already ended)
+      'same_team_fg_miss'  — same team missed FG (offensive DB reb) -> don't end
+      'end_possession'     — default; ends the current possession
+
+    Returns dict: original_index -> category string.
+    """
+    sorted_df = game_df.sort_values(
+        ["period", "secondsRemaining", "id"], ascending=[True, False, True]
+    ).reset_index()
+    db_reb_class = {}
+
+    db_mask = sorted_df["playType"] == "Dead Ball Rebound"
+    db_indices = sorted_df.index[db_mask].tolist()
+
+    for pos in db_indices:
+        row = sorted_df.iloc[pos]
+        orig_idx = row["index"]
+        db_team = row["team"]
+
+        category = "end_possession"
+        for back in range(pos - 1, max(pos - 10, -1), -1):
+            prev = sorted_df.iloc[back]
+            if prev["period"] != row["period"]:
+                break
+            prev_pt = _safe_str(prev.get("playType", ""))
+
+            if prev_pt in ("Substitution", "Official TV Timeout", ""):
+                continue
+
+            if prev_pt == "MadeFreeThrow":
+                prev_orig = prev["index"]
+                prev_is_last = last_ft_flags.get(prev_orig, False)
+                if not prev_is_last:
+                    category = "mid_ft_sequence"
+                else:
+                    prev_txt = _safe_txt(prev.get("playText", ""))
+                    if _is_made(prev_txt):
+                        category = "after_made_last_ft"
+                    else:
+                        category = "end_possession"
+                break
+
+            if prev_pt in FG_TYPES:
+                prev_txt = _safe_txt(prev.get("playText", ""))
+                if _is_missed(prev_txt):
+                    if pd.notna(prev["team"]) and pd.notna(db_team) and prev["team"] == db_team:
+                        category = "same_team_fg_miss"
+                    else:
+                        category = "end_possession"
+                break
+
+            if "Turnover" in prev_pt or prev_pt in ("PersonalFoul",):
+                break
+
+        db_reb_class[orig_idx] = category
+
+    return db_reb_class
+
+
+# ---------------------------------------------------------------------------
 # Possession tracker
 # ---------------------------------------------------------------------------
 def track_possessions_v2(game_df):
     game_df = game_df.sort_values(
-        ["period", "secondsRemaining"], ascending=[True, False]
+        ["period", "secondsRemaining", "id"], ascending=[True, False, True]
     ).copy()
     teams = [t for t in game_df["team"].unique() if pd.notna(t)]
 
@@ -237,6 +361,8 @@ def track_possessions_v2(game_df):
         return others[0] if others else None
 
     last_ft_flags = _precompute_last_ft_flags(game_df)
+    tech_ft_flags = _precompute_tech_ft_flags(game_df)
+    db_reb_classes = _classify_dead_ball_rebounds(game_df, last_ft_flags)
     poss_id = 0
     poss_team = None
     records = []
@@ -261,32 +387,38 @@ def track_possessions_v2(game_df):
                 end_poss = True
                 next_team = other_team(poss_team)
         elif pt == "MadeFreeThrow":
-            if (
-                team
-                and poss_team is not None
-                and team != poss_team
-                and last_end_reason == "made_fg"
-                and last_end_team == team
-            ):
-                poss_id -= 1
-                poss_team = team
-                for rec in reversed(records):
-                    if rec["possession_id"] == poss_id + 1:
-                        rec["possession_id"] = poss_id
-                        rec["possession_team"] = poss_team
+            # Technical FT — team retains possession, don't end
+            is_tech = tech_ft_flags.get(idx, False)
+            if is_tech:
+                outcome = "tech_ft"
+            else:
+                # And-1 detection
+                if (
+                    team
+                    and poss_team is not None
+                    and team != poss_team
+                    and last_end_reason == "made_fg"
+                    and last_end_team == team
+                ):
+                    poss_id -= 1
+                    poss_team = team
+                    for rec in reversed(records):
+                        if rec["possession_id"] == poss_id + 1:
+                            rec["possession_id"] = poss_id
+                            rec["possession_team"] = poss_team
+                        else:
+                            break
+                    last_end_reason = "and1_ft"
+                elif poss_team is None and team:
+                    poss_team = team
+                is_last = last_ft_flags.get(idx, False)
+                if is_last:
+                    if _is_made(txt):
+                        outcome = "made_ft"
+                        end_poss = True
+                        next_team = other_team(poss_team)
                     else:
-                        break
-                last_end_reason = "and1_ft"
-            elif poss_team is None and team:
-                poss_team = team
-            is_last = last_ft_flags.get(idx, False)
-            if is_last:
-                if _is_made(txt):
-                    outcome = "made_ft"
-                    end_poss = True
-                    next_team = other_team(poss_team)
-                else:
-                    outcome = "missed_last_ft"
+                        outcome = "missed_last_ft"
         elif "Turnover" in pt:
             if poss_team is None and team:
                 poss_team = team
@@ -302,9 +434,13 @@ def track_possessions_v2(game_df):
         elif pt == "Offensive Rebound":
             outcome = "off_rebound"
         elif pt == "Dead Ball Rebound":
+            # Context-aware: only end possession when appropriate
+            db_class = db_reb_classes.get(idx, "end_possession")
             outcome = "dead_ball_rebound"
-            end_poss = True
-            next_team = team
+            if db_class == "end_possession":
+                end_poss = True
+                next_team = team
+            # mid_ft_sequence, after_made_last_ft, same_team_fg_miss -> don't end
         elif pt in ("End Period", "End Game"):
             outcome = "end_period"
             end_poss = True
@@ -345,7 +481,7 @@ def track_possessions_v2(game_df):
 # ---------------------------------------------------------------------------
 def classify_possessions(possessions_df, game_df):
     game_sorted = game_df.sort_values(
-        ["period", "secondsRemaining"], ascending=[True, False]
+        ["period", "secondsRemaining", "id"], ascending=[True, False, True]
     ).reset_index(drop=True)
     game_sorted["play_order"] = range(len(game_sorted))
     time_info = game_sorted[["id", "secondsRemaining", "period", "play_order"]].rename(
@@ -467,6 +603,11 @@ def classify_possessions(possessions_df, game_df):
         )
 
     result = pd.DataFrame(possession_rows)
+
+    # Filter out end_period possessions — they are tracking artifacts, not
+    # real possessions, and inflate the per-team possession count.
+    result = result[result["raw_outcome"] != "end_period"].reset_index(drop=True)
+
     prev_enders = ["start_of_period"]
     for i_r in range(1, len(result)):
         if result.iloc[i_r]["period"] != result.iloc[i_r - 1]["period"]:

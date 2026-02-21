@@ -1,11 +1,21 @@
+# Claude Code worktrees (local dev tool)
+.claude/
+
 # API credentials
 .env
 
 # Log files
 logs/
 
-# Output data
-cbbd_data/
+# Output data — exclude CSVs and archives but track Python scripts
+cbbd_data/*.csv
+cbbd_data/*.zip
+cbbd_data/*.parquet
+
+# Ad-hoc debug / scratch files at repo root
+*.zip
+game_*.csv
+Cell output*.csv
 
 # Python
 __pycache__/
