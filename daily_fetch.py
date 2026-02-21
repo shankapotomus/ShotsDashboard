@@ -978,12 +978,10 @@ def run_pipeline(target_date: datetime, configuration, season: int):
     all_pbp_flat_df      = concat("pbp_flat")
     all_ff_df            = pd.DataFrame(ff_rows)
 
-    # Save CSVs
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    games_df.to_csv(f"{OUTPUT_DIR}/games_{date_str}_{season}.csv", index=False)
-    plays_df.to_csv(f"{OUTPUT_DIR}/plays_{date_str}_{season}.csv", index=False)
-
+    # Save CSVs — one subdir per type, one file per day
     to_save = {
+        "games":                games_df,
+        "plays":                plays_df,
         "possessions":          all_possessions_df,
         "possessions_enriched": all_poss_enriched_df,
         "shots":                all_shots_df,
@@ -994,7 +992,9 @@ def run_pipeline(target_date: datetime, configuration, season: int):
     }
     for name, df in to_save.items():
         if df is not None and len(df) > 0:
-            fname = f"{OUTPUT_DIR}/{name}_{date_str}_{season}.csv"
+            subdir = os.path.join(OUTPUT_DIR, name)
+            os.makedirs(subdir, exist_ok=True)
+            fname = os.path.join(subdir, f"{date_str}_{season}.csv")
             df.to_csv(fname, index=False)
             log.info("  Saved %s -> %s (%d rows)", name, fname, len(df))
 

@@ -1,19 +1,28 @@
 """
 consolidate_csvs.py
 -------------------
-One-time script to:
-  1. Load all existing batch CSV files, dedupe across overlapping batches
-  2. Split each data type into one file per game date
-     (matching the format daily_fetch.py uses going forward)
-  3. Delete the old batch files
+One-time migration script to:
+  1. Load all existing flat batch CSV files from cbbd_data/, dedupe across overlaps
+  2. Split each data type by actual game date (from games.startDate)
+  3. Write daily files into cbbd_data/{type}/YYYYMMDD_SEASON.csv
+  4. Delete the old flat batch files
 
 Run from the repo root:
     python cbbd_data/consolidate_csvs.py
 
-After this runs, cbbd_data/ will contain one file per type per day
-(e.g. possessions_enriched_20251103_2026.csv), just like daily_fetch.py
-produces. load_data.py dedupes automatically so any future overlaps
-between new daily files are handled safely.
+After this runs, cbbd_data/ will have the structure:
+    cbbd_data/
+      games/              20251103_2026.csv  20251104_2026.csv  ...
+      plays/              20251103_2026.csv  ...
+      possessions/        ...
+      possessions_enriched/ ...
+      shots/              ...
+      lineup_stints/      ...
+      players/            ...
+      pbp_flat/           ...
+      four_factors/       ...
+
+This matches what daily_fetch.py produces going forward.
 """
 
 import glob
@@ -39,7 +48,7 @@ DEDUP_KEYS = {
     "four_factors":         ["game_id", "team"],
 }
 
-# Column used to join each type to games for date lookup
+# Column used to look up game date per row
 GAME_ID_COL = {
     "games":                "id",
     "plays":                "gameId",
@@ -57,47 +66,49 @@ GAME_ID_COL = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_all(csv_type: str) -> pd.DataFrame:
-    """Load and dedup all batch files for a given csv_type."""
+def _find_flat_files(csv_type: str) -> list[str]:
+    """Find all flat (non-subdir) CSV files for this type in DATA_DIR."""
     pattern = os.path.join(DATA_DIR, f"{csv_type}_*.csv")
     paths = sorted(glob.glob(pattern))
-
     # possessions raw: exclude enriched files that match the same glob
     if csv_type == "possessions":
         paths = [p for p in paths if "possessions_enriched" not in os.path.basename(p)]
+    return paths
 
+
+def load_all(csv_type: str) -> pd.DataFrame:
+    """Load and dedup all flat batch/consolidated files for a given type."""
+    paths = _find_flat_files(csv_type)
     if not paths:
         return pd.DataFrame()
 
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
 
-    dedup_keys = DEDUP_KEYS[csv_type]
-    existing_keys = [k for k in dedup_keys if k in df.columns]
-    if existing_keys:
+    dedup_keys = [k for k in DEDUP_KEYS[csv_type] if k in df.columns]
+    if dedup_keys:
         before = len(df)
-        df = df.drop_duplicates(subset=existing_keys)
-        print(f"  [{csv_type}] {len(paths)} files, {before:,} -> {len(df):,} rows after dedup")
+        df = df.drop_duplicates(subset=dedup_keys)
+        print(f"  [{csv_type}] {len(paths)} file(s), {before:,} -> {len(df):,} rows after dedup")
     else:
-        print(f"  [{csv_type}] {len(paths)} files, {len(df):,} rows (no dedup keys found)")
+        print(f"  [{csv_type}] {len(paths)} file(s), {len(df):,} rows (no dedup keys found)")
 
     return df
 
 
-def build_game_date_lookup(games_df: pd.DataFrame) -> dict:
-    """Return dict of str(game_id) -> 'YYYYMMDD' from the games DataFrame."""
+def build_date_lookup(games_df: pd.DataFrame) -> dict:
+    """Return dict of str(game_id) -> 'YYYYMMDD'."""
     lookup = {}
     for _, row in games_df.iterrows():
-        date_str = str(row["startDate"])[:10].replace("-", "")  # '20251103'
+        date_str = str(row["startDate"])[:10].replace("-", "")
         lookup[str(row["id"])] = date_str
     return lookup
 
 
 def split_and_write(csv_type: str, df: pd.DataFrame, date_lookup: dict):
-    """Split df by game date and write one CSV per day."""
+    """Split df by game date and write one CSV per day into the type subdir."""
     gid_col = GAME_ID_COL[csv_type]
-
     if gid_col not in df.columns:
-        print(f"  [{csv_type}] WARNING: no '{gid_col}' column, skipping split")
+        print(f"  [{csv_type}] WARNING: no '{gid_col}' column, skipping")
         return 0
 
     df = df.copy()
@@ -105,38 +116,32 @@ def split_and_write(csv_type: str, df: pd.DataFrame, date_lookup: dict):
 
     missing = df["_date"].isna().sum()
     if missing:
-        print(f"  [{csv_type}] WARNING: {missing} rows have no matching game date, will be dropped")
-
+        print(f"  [{csv_type}] WARNING: {missing} rows have no matching game date, dropping")
     df = df.dropna(subset=["_date"])
+
+    subdir = os.path.join(DATA_DIR, csv_type)
+    os.makedirs(subdir, exist_ok=True)
 
     files_written = 0
     for date, group in df.groupby("_date"):
         group = group.drop(columns=["_date"])
-        fname = os.path.join(DATA_DIR, f"{csv_type}_{date}_{SEASON}.csv")
+        fname = os.path.join(subdir, f"{date}_{SEASON}.csv")
         group.to_csv(fname, index=False)
         files_written += 1
 
-    print(f"  [{csv_type}] Written {files_written} daily files")
+    print(f"  [{csv_type}] Written {files_written} daily file(s) -> cbbd_data/{csv_type}/")
     return files_written
 
 
-def delete_batch_files(csv_type: str, daily_file_dates: set):
-    """Delete files whose name contains two 8-digit date blocks (old batch files)."""
-    pattern = os.path.join(DATA_DIR, f"{csv_type}_*.csv")
-    paths = sorted(glob.glob(pattern))
-    if csv_type == "possessions":
-        paths = [p for p in paths if "possessions_enriched" not in os.path.basename(p)]
-
+def delete_flat_files(csv_type: str):
+    """Delete all flat files for this type from DATA_DIR (not subdirs)."""
+    paths = _find_flat_files(csv_type)
     deleted = []
     for p in paths:
-        name = os.path.basename(p)
-        parts = [s for s in name.replace(".csv", "").split("_") if s.isdigit() and len(s) == 8]
-        if len(parts) >= 2:  # two date blocks = batch file
-            os.remove(p)
-            deleted.append(name)
-
+        os.remove(p)
+        deleted.append(os.path.basename(p))
     if deleted:
-        print(f"  [{csv_type}] Deleted {len(deleted)} batch file(s): {', '.join(deleted)}")
+        print(f"  [{csv_type}] Deleted {len(deleted)} old flat file(s): {', '.join(deleted)}")
 
 
 # ---------------------------------------------------------------------------
@@ -145,38 +150,35 @@ def delete_batch_files(csv_type: str, daily_file_dates: set):
 def main():
     print(f"Working directory: {DATA_DIR}\n")
 
-    # Step 1: load games first to build the date lookup
-    print("=== Loading games ===")
+    # Games first — needed to build the date lookup
+    print("=== games ===")
     games_df = load_all("games")
     if games_df.empty:
         print("ERROR: no games files found — cannot build date lookup. Aborting.")
         return
 
-    date_lookup = build_game_date_lookup(games_df)
-    print(f"  Date lookup built: {len(date_lookup)} games across {len(set(date_lookup.values()))} dates\n")
-
-    # Step 2: write games daily files and delete batch
-    print("=== Splitting games ===")
+    date_lookup = build_date_lookup(games_df)
+    print(f"  Date lookup: {len(date_lookup)} games across {len(set(date_lookup.values()))} dates")
     split_and_write("games", games_df, date_lookup)
-    delete_batch_files("games", set())
+    delete_flat_files("games")
     print()
 
-    # Step 3: process all other types
+    # All other types
     for csv_type in DEDUP_KEYS:
         if csv_type == "games":
             continue
         print(f"=== {csv_type} ===")
         df = load_all(csv_type)
         if df.empty:
-            print(f"  [{csv_type}] No data, skipping\n")
+            print(f"  [{csv_type}] No flat files found, skipping\n")
             continue
         split_and_write(csv_type, df, date_lookup)
-        delete_batch_files(csv_type, set())
+        delete_flat_files(csv_type)
         print()
 
-    print("Done.")
-    print("cbbd_data/ now has one file per type per game date.")
-    print("daily_fetch.py will continue appending in the same format going forward.")
+    print("Migration complete.")
+    print("cbbd_data/ now has one subdir per type, one file per game date.")
+    print("daily_fetch.py will continue writing in this format going forward.")
 
 
 if __name__ == "__main__":

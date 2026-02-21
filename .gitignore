@@ -7,10 +7,12 @@
 # Log files
 logs/
 
-# Output data — exclude CSVs and archives but track Python scripts
+# Output data — exclude CSVs and archives but track Python scripts in cbbd_data/
 cbbd_data/*.csv
 cbbd_data/*.zip
 cbbd_data/*.parquet
+cbbd_data/**/*.csv
+cbbd_data/**/*.parquet
 
 # Ad-hoc debug / scratch files at repo root
 *.zip
