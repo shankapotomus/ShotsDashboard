@@ -1021,6 +1021,16 @@ def main():
     )
     args = parser.parse_args()
 
+    # Load .env file from repo root if present (for local dev / Task Scheduler)
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.isfile(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
     api_key = os.environ.get("CBBD_API_KEY", "").strip()
     if not api_key:
         log.error("CBBD_API_KEY environment variable is not set.")
