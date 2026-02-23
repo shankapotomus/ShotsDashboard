@@ -895,9 +895,13 @@ def run_pipeline(target_date: datetime, configuration, season: int):
         games_api = cbbd.GamesApi(api_client)
         plays_api = cbbd.PlaysApi(api_client)
 
+        # CBBD API uses UTC dates. Send the full UTC calendar day so we
+        # capture all games regardless of tip-off time in any US timezone.
+        start_of_day_utc = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day_utc = target_date.replace(hour=23, minute=59, second=59, microsecond=0)
         games = games_api.get_games(
-            start_date_range=target_date,
-            end_date_range=target_date,
+            start_date_range=start_of_day_utc,
+            end_date_range=end_of_day_utc,
             season=season,
         )
         games_df = pd.DataFrame([g.to_dict() for g in games])

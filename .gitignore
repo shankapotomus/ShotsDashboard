@@ -18,6 +18,7 @@ cbbd_data/**/*.parquet
 *.zip
 game_*.csv
 Cell output*.csv
+audit_*.csv
 
 # Python
 __pycache__/
