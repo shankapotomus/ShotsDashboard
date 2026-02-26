@@ -8,12 +8,19 @@ Handles both API text formats:
   NEW: "Player makes 18-foot jumper" / "makes free throw 2 of 2"
   OLD: "Player made Layup." / "made Free Throw."
 
-v5 fixes:
+v7 fixes:
   1. M-of-N regex for last-FT detection (not just N-of-N)
   2. id tiebreaker in sort for stable ordering
   3. Context-aware dead ball rebounds
   4. end_period filtered from enriched output
   5. Technical foul FTs don't end possession
+  6. Old-format last-FT detection skips subs/timeouts between FTs so
+     substitutions mid-FT-sequence no longer cause phantom possession splits
+  7. Steal play reassigned to the turnover possession (not the next one)
+     so live_ball_turnover is correctly classified
+  8. Old-format last-FT detection also skips Dead Ball Rebounds between FTs
+     so a missed non-last FT followed by a dead ball rebound no longer
+     creates a phantom possession split for the remaining FT attempt
 """
 
 import pandas as pd
@@ -23,9 +30,13 @@ import os
 import time
 
 # ---------------------------------------------------------------------------
-# Analysis functions — fixed for dual text format (v5)
+# Analysis functions — fixed for dual text format (v6)
 # ---------------------------------------------------------------------------
 FG_TYPES = {'JumpShot', 'LayUpShot', 'DunkShot', 'TipShot'}
+
+# Play types that are "noise" between meaningful plays — skip when scanning
+_SKIP_TYPES = {'Substitution', 'Official TV Timeout', 'OfficialTVTimeOut',
+               'ShortTimeOut', 'RegularTimeOut', ''}
 
 
 def _is_made(txt):
@@ -53,16 +64,20 @@ def _safe_str(val):
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 + Fix 2: Last-FT detection with M-of-N regex + id tiebreaker sort
+# Fix 1 + Fix 2 + Fix 6: Last-FT detection
 # ---------------------------------------------------------------------------
 def _precompute_last_ft_flags(game_df):
     """Pre-compute which MadeFreeThrow rows are the last FT in a sequence.
 
     NEW format: has 'M of N' pattern — last when M == N (e.g. '2 of 2').
-    OLD format: no 'M of N'; detect last FT by checking whether the next
-                play is also a MadeFreeThrow at the same clock time.
+    OLD format: no 'M of N'; scan forward past subs/timeouts to find the
+                next meaningful play. If it's another MadeFreeThrow at the
+                same clock, this FT is not the last one.
 
-    Uses 'id' as sort tiebreaker for stable ordering at the same clock.
+    Fix 6: old-format path now skips Substitution / timeout rows so that
+    subs inserted between two FTs no longer cause the first FT to be
+    incorrectly flagged as the last, which was producing phantom possession
+    splits mid-free-throw-sequence.
     """
     sorted_df = game_df.sort_values(
         ['period', 'secondsRemaining', 'id'], ascending=[True, False, True]
@@ -84,18 +99,32 @@ def _precompute_last_ft_flags(game_df):
             is_last_ft[orig_idx] = (m_val == n_val)
             continue
 
-        # Old format: check if the NEXT row is also a FT at the same clock
-        if pos + 1 < len(sorted_df):
-            next_row = sorted_df.iloc[pos + 1]
+        # Fix 6 — Old format: scan forward skipping subs/timeouts/dead ball
+        # rebounds to find the next meaningful play, then check if it's
+        # another FT at the same clock.
+        # NOTE: Dead Ball Rebound must also be skipped here — a missed
+        # non-last FT is followed by a dead ball rebound before the next
+        # FT attempt. Without skipping it, the scan stops at the dead ball
+        # rebound, incorrectly marks the FT as "last", and causes
+        # _classify_dead_ball_rebounds to split the possession.
+        _SKIP_FOR_LAST_FT = _SKIP_TYPES | {'Dead Ball Rebound'}
+        is_last = True  # default: assume last unless we find another FT
+        for nxt in range(pos + 1, len(sorted_df)):
+            next_row = sorted_df.iloc[nxt]
+            next_pt = _safe_str(next_row.get('playType', ''))
+
+            # Skip noise rows — subs/timeouts/dead ball rebounds between FTs
+            if next_pt in _SKIP_FOR_LAST_FT:
+                continue
+
+            # Found the next meaningful play — is it another FT at same clock?
             same_clock = (next_row['period'] == row['period']
                           and next_row['secondsRemaining'] == row['secondsRemaining'])
-            next_is_ft = next_row['playType'] == 'MadeFreeThrow'
-            if same_clock and next_is_ft:
-                is_last_ft[orig_idx] = False
-            else:
-                is_last_ft[orig_idx] = True
-        else:
-            is_last_ft[orig_idx] = True  # last play in game
+            if same_clock and next_pt == 'MadeFreeThrow':
+                is_last = False
+            break  # stop after first meaningful play regardless
+
+        is_last_ft[orig_idx] = is_last
 
     return is_last_ft
 
@@ -181,7 +210,7 @@ def _classify_dead_ball_rebounds(game_df, last_ft_flags):
             prev_pt = _safe_str(prev.get('playType', ''))
 
             # Skip non-play events
-            if prev_pt in ('Substitution', 'Official TV Timeout', ''):
+            if prev_pt in _SKIP_TYPES:
                 continue
 
             if prev_pt == 'MadeFreeThrow':
@@ -219,7 +248,7 @@ def _classify_dead_ball_rebounds(game_df, last_ft_flags):
 
 
 # ---------------------------------------------------------------------------
-# Possession tracker (state machine) — v5
+# Possession tracker (state machine) — v6
 # ---------------------------------------------------------------------------
 def track_possessions_v2(game_df):
     """State-machine possession tracker."""
@@ -300,7 +329,26 @@ def track_possessions_v2(game_df):
             end_poss = True
             next_team = other_team(poss_team)
         elif pt == 'Steal':
+            # Fix 7: Steal almost always has id = LBT_id + 1, so it sorts
+            # AFTER the Lost Ball Turnover. By the time we reach it, the
+            # turnover has already fired end_poss and poss_id has incremented.
+            # We retroactively pull the steal back onto the previous possession
+            # (same approach as and-1 detection) by decrementing poss_id,
+            # appending onto the old possession, then re-incrementing.
             outcome = 'steal'
+            poss_id -= 1
+            records.append({
+                'play_id': row.get('id'),
+                'gameId':  row.get('gameId'),
+                'possession_id': poss_id,
+                'possession_team': last_end_team,  # the team that turned it over
+                'play_type': pt,
+                'play_text': row.get('playText', ''),
+                'team': team,
+                'outcome': outcome,
+            })
+            poss_id += 1
+            continue  # skip the normal records.append below
         elif pt == 'Defensive Rebound':
             outcome = 'def_rebound'
             end_poss = True
@@ -337,7 +385,8 @@ def track_possessions_v2(game_df):
             poss_id += 1
             poss_team = next_team
         elif pt not in ('PersonalFoul', 'MadeFreeThrow', 'Substitution',
-                        'Official TV Timeout', ''):
+                        'Official TV Timeout', 'OfficialTVTimeOut',
+                        'ShortTimeOut', 'RegularTimeOut', ''):
             last_end_reason = None
             last_end_team = None
 
@@ -376,7 +425,11 @@ def classify_possessions(possessions_df, game_df):
         has_steal = 'steal' in outcome_set
         has_oreb  = 'off_rebound' in outcome_set
 
-        if final_outcome == 'turnover':
+        if final_outcome == 'steal':
+            # Steal row was retroactively placed on the turnover possession,
+            # so it ends up as the final outcome — always a live ball TO
+            refined = 'live_ball_turnover'
+        elif final_outcome == 'turnover':
             refined = 'live_ball_turnover' if has_steal else 'dead_ball_turnover'
         elif final_outcome == 'def_rebound':
             miss_type = 'fga'
@@ -465,20 +518,34 @@ def classify_possessions(possessions_df, game_df):
 
 
 # ---------------------------------------------------------------------------
-# Main: iterate over all plays files
+# Main: read from cbbd_data/plays/ subdirectory, write back to
+#       cbbd_data/possessions/ and cbbd_data/possessions_enriched/
 # ---------------------------------------------------------------------------
-data_dir = '.'
+# Locate cbbd_data/ — script lives inside it, so use its own directory
+data_dir = os.path.dirname(os.path.abspath(__file__))
 
-plays_files = sorted([f for f in os.listdir(data_dir) if f.startswith('plays_') and f.endswith('.csv')])
+plays_dir      = os.path.join(data_dir, 'plays')
+poss_dir       = os.path.join(data_dir, 'possessions')
+enriched_dir   = os.path.join(data_dir, 'possessions_enriched')
+
+os.makedirs(poss_dir,     exist_ok=True)
+os.makedirs(enriched_dir, exist_ok=True)
+
+plays_files = sorted([
+    f for f in os.listdir(plays_dir)
+    if f.endswith('.csv')
+])
+
+print(f'Found {len(plays_files)} plays files in {plays_dir}')
+
+total_failed = []
 
 for plays_file in plays_files:
-    suffix = plays_file.replace('plays_', '').replace('.csv', '')
-
     print(f'\n{"="*65}')
     print(f'Processing {plays_file} ...')
     print(f'{"="*65}')
 
-    plays_df = pd.read_csv(os.path.join(data_dir, plays_file))
+    plays_df = pd.read_csv(os.path.join(plays_dir, plays_file))
     game_ids = plays_df['gameId'].unique()
     n_games = len(game_ids)
     print(f'  {n_games} games, {len(plays_df):,} plays')
@@ -497,6 +564,7 @@ for plays_file in plays_files:
             all_enriched.append(enriched_df)
         except Exception as e:
             failed.append((gid, str(e)))
+            total_failed.append((plays_file, gid, str(e)))
 
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
@@ -510,19 +578,23 @@ for plays_file in plays_files:
 
     if all_poss:
         combined_poss = pd.concat(all_poss, ignore_index=True)
-        fname = f'possessions_{suffix}.csv'
-        combined_poss.to_csv(os.path.join(data_dir, fname), index=False)
-        print(f'  Saved {fname}: {len(combined_poss):,} rows')
+        out_path = os.path.join(poss_dir, plays_file)
+        combined_poss.to_csv(out_path, index=False)
+        print(f'  Saved possessions/{plays_file}: {len(combined_poss):,} rows')
         made_fg = (combined_poss['outcome'] == 'made_fg').sum()
         made_ft = (combined_poss['outcome'] == 'made_ft').sum()
         print(f'    made_fg={made_fg:,}, made_ft={made_ft:,}')
 
     if all_enriched:
         combined_enriched = pd.concat(all_enriched, ignore_index=True)
-        fname = f'possessions_enriched_{suffix}.csv'
-        combined_enriched.to_csv(os.path.join(data_dir, fname), index=False)
-        print(f'  Saved {fname}: {len(combined_enriched):,} rows')
+        out_path = os.path.join(enriched_dir, plays_file)
+        combined_enriched.to_csv(out_path, index=False)
+        print(f'  Saved possessions_enriched/{plays_file}: {len(combined_enriched):,} rows')
         print(f'    Outcome distribution:')
         print(combined_enriched['refined_outcome'].value_counts().head(10).to_string())
 
-print('\n\nALL DONE.')
+print(f'\n\nALL DONE. Total failed games: {len(total_failed)}')
+if total_failed:
+    print('Failed games:')
+    for f, gid, err in total_failed[:20]:
+        print(f'  {f} game {gid}: {err}')
