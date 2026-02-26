@@ -14,15 +14,24 @@ from data_loader import load_all_data
 from metrics import (
     BUCKET_LABELS, BUCKET_ORDER,
     CLOCK_LABELS, CLOCK_ORDER,
+    GRADE_COLORS, GRADE_LABELS, GRADE_ORDER,
     ZONE_LABELS, ZONE_ORDER,
+    _PTYPE_ORDER, _PTYPE_LABELS,
     compute_assisted_metrics,
     compute_bucket_metrics,
     compute_clock_zone_metrics,
     compute_four_factors,
+    compute_league_stats,
+    compute_poss_ppp_league,
     compute_poss_type_summary,
     compute_team_conference,
     compute_team_record,
+    compute_threept_context,
     compute_zone_metrics,
+    get_d1_teams,
+    percentile_rank,
+    poss_percentile_rank,
+    _ordinal,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -90,6 +99,77 @@ def pct_fmt(v, decimals=1) -> str:
     return "—" if pd.isna(v) else f"{v:.{decimals}f}%"
 
 
+def val_fmt(v, decimals=1) -> str:
+    """Format a non-percentage number (points, etc.)."""
+    return "—" if pd.isna(v) else f"{v:.{decimals}f}"
+
+
+# YlOrBr ColorBrewer sequential scale — color-blind safe.
+# High percentile = dark orange-red (hot/vibrant), low = pale cream (recedes).
+_YLORB_SCALE = [
+    (10,  "#FFF7BC"),   # 0–10   very poor   — pale yellow (washed out)
+    (25,  "#FEE391"),   # 11–25  poor        — light amber
+    (40,  "#FEC44F"),   # 26–40  below avg   — amber
+    (55,  "#FB9A29"),   # 41–55  around avg  — medium orange
+    (70,  "#EC7014"),   # 56–70  above avg   — deep orange
+    (85,  "#D94801"),   # 71–85  good        — burnt orange
+    (100, "#CC4C02"),   # 86–100 elite       — dark orange-red (hot)
+]
+
+
+def _pct_color(pct: int | None) -> str:
+    """Map 0–100 percentile → YlOrBr hex color (high = dark orange-red)."""
+    if pct is None:
+        return "#6c7a9c"   # muted gray for missing / not ranked
+    for threshold, color in _YLORB_SCALE:
+        if pct <= threshold:
+            return color
+    return "#CC4C02"
+
+
+def _indicator(pct: int | None) -> str:
+    """Return colored ✓/✗ indicator HTML based on percentile thresholds.
+
+    Check marks (teal):  ≥66 → ✓,  ≥75 → ✓✓,  ≥95 → ✓✓✓
+    Red X marks (red):   ≤33 → ✗,  ≤25 → ✗✗,  ≤5  → ✗✗✗
+    """
+    if pct is None:
+        return ""
+    if pct <= 5:
+        return '<span style="color:#e05c5c;font-size:0.8rem;">✗✗✗</span>'
+    elif pct <= 25:
+        return '<span style="color:#e05c5c;font-size:0.8rem;">✗✗</span>'
+    elif pct <= 33:
+        return '<span style="color:#e05c5c;font-size:0.8rem;">✗</span>'
+    elif pct >= 95:
+        return '<span style="color:#4ec9b0;font-size:0.8rem;">✓✓✓</span>'
+    elif pct >= 75:
+        return '<span style="color:#4ec9b0;font-size:0.8rem;">✓✓</span>'
+    elif pct >= 66:
+        return '<span style="color:#4ec9b0;font-size:0.8rem;">✓</span>'
+    return ""
+
+
+def _ff_card(label: str, value: str, pct: int | None) -> str:
+    """Render a Four-Factors metric card with color-scaled percentile + indicator."""
+    pct_text  = f"{_ordinal(pct)} pct" if pct is not None else "—"
+    color     = _pct_color(pct)
+    indicator = _indicator(pct)
+    return (
+        f'<div style="background:#1e2130;border:1px solid #2d3150;border-radius:8px;'
+        f'padding:12px 10px;">'
+        f'<div style="font-size:0.65rem;color:#9aa0b0;text-transform:uppercase;'
+        f'letter-spacing:.05em;margin-bottom:4px;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis;">{label}</div>'
+        f'<div style="font-size:1.55rem;font-weight:700;color:#ffffff;margin-bottom:6px;white-space:nowrap;">'
+        f'{value}</div>'
+        f'<div style="font-size:0.68rem;font-weight:600;color:{color};'
+        f'display:flex;align-items:center;gap:4px;white-space:nowrap;">'
+        f'{pct_text}&nbsp;{indicator}</div>'
+        f'</div>'
+    )
+
+
 def _bar_fig(df, x, y, color_map, title="", xrange=None, orientation="h"):
     """Thin wrapper to make a horizontal bar chart with custom colours."""
     df = df.copy()
@@ -128,9 +208,63 @@ def _bar_fig(df, x, y, color_map, title="", xrange=None, orientation="h"):
 # ── Load data (cached) ─────────────────────────────────────────────────────────
 shots, possessions, four_factors, games = load_all_data()
 
+
+@st.cache_data(show_spinner="Computing D1 percentiles…")
+def _get_league_stats(_shots, _ff, _games):
+    return compute_league_stats(_shots, _ff, _games)
+
+
+@st.cache_data(show_spinner="Computing possession percentiles…")
+def _get_poss_league_stats(_shots, _poss, _games):
+    return compute_poss_ppp_league(_shots, _poss, _games)
+
+
+@st.cache_data(show_spinner="Loading team info…")
+def _load_team_info():
+    """Fetch team metadata (display name, ESPN logo ID, colors) from CBBD API."""
+    import cbbd
+    import os
+    api_key = os.environ.get("CBBD_API_KEY", "")
+    configuration = cbbd.Configuration(access_token=api_key)
+    with cbbd.ApiClient(configuration) as api_client:
+        teams = cbbd.TeamsApi(api_client).get_teams(season=2026)
+    rows = []
+    for t in teams:
+        d = t.to_dict()
+        rows.append({
+            "school":       d.get("school", ""),
+            "display_name": d.get("displayName", d.get("school", "")),
+            "espn_id":      str(d.get("sourceId", "")),
+            "primary_color": "#" + str(d.get("primaryColor", "4e9af1")).lstrip("#"),
+        })
+    return pd.DataFrame(rows).set_index("school")
+
+
+league_stats      = _get_league_stats(shots, four_factors, games)
+poss_league_stats = _get_poss_league_stats(shots, possessions, games)
+team_info_df      = _load_team_info()
+
+# ── D1 teams (10+ games) ───────────────────────────────────────────────────────
+_d1_set = get_d1_teams(games)
 all_teams = sorted(
-    shots["team"].dropna().unique().tolist()
+    t for t in shots["team"].dropna().unique() if t in _d1_set
 )
+
+
+def _team_logo_url(school: str) -> str:
+    """Return ESPN CDN logo URL for a school, or '' if not found."""
+    if school in team_info_df.index:
+        espn_id = team_info_df.at[school, "espn_id"]
+        if espn_id:
+            return f"https://a.espncdn.com/i/teamlogos/ncaa/500/{espn_id}.png"
+    return ""
+
+
+def _display_name(school: str) -> str:
+    """Return full display name (e.g. 'Duke Blue Devils') for a school."""
+    if school in team_info_df.index:
+        return team_info_df.at[school, "display_name"]
+    return school
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -138,7 +272,10 @@ with st.sidebar:
     st.caption("2025–26 Season")
 
     selected_team = st.selectbox(
-        "Team", all_teams, index=all_teams.index("Duke") if "Duke" in all_teams else 0
+        "Team",
+        all_teams,
+        index=all_teams.index("Duke") if "Duke" in all_teams else 0,
+        format_func=_display_name,
     )
 
     side = st.radio("Perspective", ["Offense", "Defense"], horizontal=True)
@@ -150,15 +287,32 @@ with st.sidebar:
     )
 
 # ── Team header ────────────────────────────────────────────────────────────────
-conf  = compute_team_conference(games, selected_team)
-rec   = compute_team_record(games, selected_team)
+conf      = compute_team_conference(games, selected_team)
+rec       = compute_team_record(games, selected_team)
+logo_url  = _team_logo_url(selected_team)
+full_name = _display_name(selected_team)
 
-h1, h2 = st.columns([3, 1])
-with h1:
-    st.title(f"{selected_team}")
-    st.caption(f"{conf}  ·  {rec}  ·  **{side}**")
-with h2:
-    st.write("")
+logo_html = (
+    f'<img src="{logo_url}" width="72" height="72" '
+    f'style="border-radius:8px;object-fit:contain;background:transparent;" '
+    f'onerror="this.style.display=\'none\'" />'
+    if logo_url else ""
+)
+
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:center;gap:16px;padding:8px 0 4px 0;">
+      {logo_html}
+      <div>
+        <div style="font-size:2rem;font-weight:800;line-height:1.1;">{full_name}</div>
+        <div style="font-size:0.9rem;color:#9aa0b0;margin-top:2px;">
+          {conf}&nbsp;&nbsp;·&nbsp;&nbsp;{rec}&nbsp;&nbsp;·&nbsp;&nbsp;<strong style="color:#ffffff;">{side}</strong>
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.markdown("---")
 
@@ -168,51 +322,140 @@ zone_df    = compute_zone_metrics(shots, selected_team, side)
 bucket_df  = compute_bucket_metrics(shots, selected_team, side)
 clock_df   = compute_clock_zone_metrics(shots, selected_team, side)
 ast_df     = compute_assisted_metrics(shots, selected_team, side)
-poss_sum   = compute_poss_type_summary(possessions, games, selected_team, side)
+poss_sum   = compute_poss_type_summary(possessions, games, selected_team, side, shots=shots)
+threept_ctx = compute_threept_context(shots, selected_team, side)
 
-# ── SECTION 1: Four Factors ────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Four Factors</div>', unsafe_allow_html=True)
+# ── SECTION 1: Four Factors + Transition ──────────────────────────────────────
+st.markdown('<div class="section-header">Four Factors + Transition</div>', unsafe_allow_html=True)
 
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
-    st.metric("eFG%", pct_fmt(ff_stats.get("efg")))
-with c2:
-    st.metric("Turnover %", pct_fmt(ff_stats.get("to_pct")))
-with c3:
-    st.metric("Off Reb %", pct_fmt(ff_stats.get("orb_pct")))
-with c4:
-    st.metric("FT Rate (FTM/FGA)", pct_fmt(ff_stats.get("ft_rate")))
-with c5:
-    st.metric("Tempo (poss/g)", f"{ff_stats.get('tempo', 0):.1f}")
+_ff_metrics = [
+    ("eFG%",           pct_fmt(ff_stats.get("efg")),              "efg"),
+    ("Turnover %",     pct_fmt(ff_stats.get("to_pct")),           "to_pct"),
+    ("Off Reb %",      pct_fmt(ff_stats.get("orb_pct")),          "orb_pct"),
+    ("FT Rate",        pct_fmt(ff_stats.get("ft_rate")),          "ft_rate"),
+    ("Trans Pts / 100", val_fmt(ff_stats.get("trans_pts_per100")), "trans_pts_per100"),
+]
+for col, (label, value, metric_key) in zip(st.columns(5), _ff_metrics):
+    pct = percentile_rank(league_stats, selected_team, side, metric_key)
+    with col:
+        st.markdown(_ff_card(label, value, pct), unsafe_allow_html=True)
 
-# ── SECTION 2: Possession-type summary ────────────────────────────────────────
+# ── SECTION 2: Possession Breakdown ───────────────────────────────────────────
 st.markdown('<div class="section-header">Possession Breakdown</div>', unsafe_allow_html=True)
 
-if not poss_sum.empty:
-    p_cols = st.columns(len(poss_sum))
-    ptype_color = {
-        "Transition":       "#4ec9b0",
-        "Half Court":       "#4e9af1",
-        "Second Chance":    "#e07c40",
-        "Scramble Putback": "#e05c5c",
-    }
-    for i, row in poss_sum.iterrows():
-        with p_cols[i]:
-            c = ptype_color.get(row["poss_type"], "#9aa0b0")
-            st.markdown(
-                f"""
-                <div style="background:#1e2130;border:1px solid #2d3150;border-top:3px solid {c};
-                            border-radius:8px;padding:12px;text-align:center;">
-                  <div style="font-size:0.72rem;color:#9aa0b0;text-transform:uppercase;
-                               letter-spacing:.06em;">{row['poss_type']}</div>
-                  <div style="font-size:1.5rem;font-weight:700;margin:4px 0">{row['share']:.1f}%</div>
-                  <div style="font-size:0.75rem;color:#9aa0b0">
-                    FG%&nbsp;{pct_fmt(row['fg_pct'])} &nbsp;|&nbsp; TO%&nbsp;{pct_fmt(row['to_pct'])}
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+_PTYPE_COLORS = {
+    "transition":       "#4ec9b0",
+    "half_court":       "#4e9af1",
+    "second_chance":    "#e07c40",
+    "scramble_putback": "#e05c5c",
+}
+
+if not poss_sum.empty and poss_sum["ppp"].notna().any():
+    poss_sum = poss_sum.copy()
+    poss_sum["contribution"] = poss_sum["share"] / 100.0 * poss_sum["ppp"].fillna(0)
+    overall_ppp = poss_sum["contribution"].sum()
+
+    # ── Stacked PPP bar ───────────────────────────────────────────────────────
+    fig_ppp = go.Figure()
+    for _, row in poss_sum.iterrows():
+        contrib = row["contribution"]
+        c = _PTYPE_COLORS.get(row["poss_type_key"], "#9aa0b0")
+        label = _PTYPE_LABELS.get(row["poss_type_key"], row["poss_type"])
+        fig_ppp.add_trace(go.Bar(
+            x=[contrib],
+            y=["PPP"],
+            orientation="h",
+            name=label,
+            marker_color=c,
+            text=f"<b>{label}</b><br>{contrib:.2f} pts",
+            textposition="inside",
+            insidetextanchor="middle",
+            hovertemplate=(
+                f"<b>{label}</b><br>"
+                f"PPP: {row['ppp']:.2f}<br>"
+                f"Freq: {row['share']:.1f}%<br>"
+                f"Contribution: {contrib:.2f} pts<extra></extra>"
+            ),
+        ))
+
+    # Reference line at D1 average (≈1.0) and team total
+    fig_ppp.add_vline(x=1.0, line_dash="dash", line_color="#555",
+                      annotation_text="Avg", annotation_font_size=10,
+                      annotation_position="top")
+    fig_ppp.add_vline(x=overall_ppp, line_dash="dot", line_color="#9aa0b0",
+                      annotation_text=f"{overall_ppp:.2f}",
+                      annotation_font_size=10, annotation_position="bottom right")
+
+    fig_ppp.update_layout(
+        template=PLOTLY_TEMPLATE,
+        barmode="stack",
+        height=110,
+        margin=dict(l=0, r=20, t=8, b=28),
+        xaxis=dict(range=[0.6, 1.4], showgrid=True, gridcolor="#2d3150",
+                   title="Points Per Possession (field goals)", title_font_size=11,
+                   tickvals=[0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]),
+        yaxis=dict(showticklabels=False, showgrid=False),
+        legend=dict(orientation="h", y=-0.55, x=0.5, xanchor="center",
+                    font_size=11),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_ppp, use_container_width=True)
+
+    # ── Table: frequency + PPP with percentiles ───────────────────────────────
+    # Header
+    def _td(txt, color="#9aa0b0", bold=False, align="right"):
+        fw = "700" if bold else "400"
+        return (f'<td style="padding:6px 10px;font-size:0.75rem;color:{color};'
+                f'font-weight:{fw};text-align:{align};">{txt}</td>')
+
+    def _pct_badge(pct: int | None) -> str:
+        if pct is None:
+            return '<span style="color:#6c7a9c;font-size:0.68rem;">—</span>'
+        col = _pct_color(pct)
+        ind = _indicator(pct)
+        return (f'<span style="color:{col};font-size:0.68rem;font-weight:600;">'
+                f'{_ordinal(pct)} pct</span>'
+                + (f'&nbsp;{ind}' if ind else ''))
+
+    header = (
+        '<table style="width:100%;border-collapse:collapse;margin-top:6px;">'
+        '<thead><tr style="border-bottom:1px solid #2d3150;">'
+        + _td("Possession Type", align="left", bold=True, color="#9aa0b0")
+        + _td("Freq %", bold=True, color="#9aa0b0")
+        + _td("Freq Pctl", bold=True, color="#9aa0b0")
+        + _td("PPP", bold=True, color="#9aa0b0")
+        + _td("PPP Pctl", bold=True, color="#9aa0b0")
+        + '</tr></thead><tbody>'
+    )
+
+    body = ""
+    for _, row in poss_sum.iterrows():
+        pt_key = row["poss_type_key"]
+        c = _PTYPE_COLORS.get(pt_key, "#9aa0b0")
+        label = _PTYPE_LABELS.get(pt_key, row["poss_type"])
+
+        freq_pct = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "share")
+        ppp_pct  = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "ppp")
+
+        ppp_val = f"{row['ppp']:.2f}" if pd.notna(row["ppp"]) else "—"
+
+        body += (
+            f'<tr style="border-bottom:1px solid #1e2130;">'
+            + _td(
+                f'<span style="display:inline-block;width:8px;height:8px;'
+                f'border-radius:50%;background:{c};margin-right:7px;"></span>'
+                f'<span style="color:#e0e4f0;">{label}</span>',
+                align="left",
             )
+            + _td(f"{row['share']:.1f}%", color="#e0e4f0", bold=True)
+            + _td(_pct_badge(freq_pct))
+            + _td(ppp_val, color="#e0e4f0", bold=True)
+            + _td(_pct_badge(ppp_pct))
+            + '</tr>'
+        )
+
+    st.markdown(header + body + '</tbody></table>', unsafe_allow_html=True)
 
 # ── SECTION 3: Possession bucket × shot efficiency ────────────────────────────
 st.markdown(
@@ -467,93 +710,185 @@ if not clock_df.empty:
         )
         st.plotly_chart(fig_heat_efg, use_container_width=True)
 
-# ── SECTION 6: Assisted / Unassisted ─────────────────────────────────────────
+# ── SECTION 6: Assisted ───────────────────────────────────────────────────────
 st.markdown(
-    '<div class="section-header">Assisted vs Unassisted</div>',
+    '<div class="section-header">Assisted Scoring</div>',
     unsafe_allow_html=True,
 )
+st.caption("Assist rate = % of made FGs credited to an assisting player")
 
 if not ast_df.empty:
+    zones_labels = [ZONE_LABELS[z] for z in ZONE_ORDER]
+    zcolors = [ZONE_COLORS.get(ZONE_LABELS[z], "#6c7a9c") for z in ZONE_ORDER]
     a_left, a_right = st.columns(2)
 
     with a_left:
-        # Stacked bar: Assisted% vs Unassisted%
-        fig_ast = go.Figure()
-        zcolors = [ZONE_COLORS.get(ZONE_LABELS[z], "#6c7a9c") for z in ZONE_ORDER]
-        zones_labels = [ZONE_LABELS[z] for z in ZONE_ORDER]
-
-        fig_ast.add_trace(
+        # FG% per zone
+        fig_ast_fg = go.Figure()
+        fig_ast_fg.add_trace(
             go.Bar(
                 x=zones_labels,
-                y=ast_df["ast_share"].tolist(),
-                name="Assisted",
+                y=ast_df["fg_pct"].tolist(),
                 marker_color=zcolors,
-                text=[f"{v:.0f}%" for v in ast_df["ast_share"]],
-                textposition="inside",
+                showlegend=False,
+                text=[pct_fmt(v) for v in ast_df["fg_pct"]],
+                textposition="outside",
             )
         )
-        fig_ast.add_trace(
-            go.Bar(
-                x=zones_labels,
-                y=(100 - ast_df["ast_share"]).tolist(),
-                name="Unassisted",
-                marker_color=zcolors,
-                opacity=0.3,
-                text=[f"{100-v:.0f}%" for v in ast_df["ast_share"]],
-                textposition="inside",
-                showlegend=True,
-            )
-        )
-        fig_ast.update_layout(
+        fig_ast_fg.update_layout(
             template=PLOTLY_TEMPLATE,
-            title="Assisted Shot Share by Zone",
-            barmode="stack",
+            title="FG% by Zone",
             margin=dict(l=10, r=10, t=35, b=60),
             height=280,
-            yaxis=dict(range=[0, 105], showgrid=False, title="% of FGA"),
+            yaxis=dict(range=[0, 80], showgrid=True, gridcolor="#2d3150"),
             xaxis=dict(tickangle=-20),
-            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_ast, use_container_width=True)
+        st.plotly_chart(fig_ast_fg, use_container_width=True)
 
     with a_right:
-        # FG% — Assisted vs Unassisted per zone
-        fig_ast2 = go.Figure()
-        fig_ast2.add_trace(
+        # % of makes that were assisted per zone
+        fig_ast_rate = go.Figure()
+        fig_ast_rate.add_trace(
             go.Bar(
                 x=zones_labels,
-                y=ast_df["ast_fg_pct"].tolist(),
-                name="Assisted FG%",
-                marker_color="#4e9af1",
-                text=[pct_fmt(v) for v in ast_df["ast_fg_pct"]],
+                y=ast_df["ast_on_makes"].tolist(),
+                marker_color=zcolors,
+                showlegend=False,
+                text=[pct_fmt(v) for v in ast_df["ast_on_makes"]],
                 textposition="outside",
             )
         )
-        fig_ast2.add_trace(
-            go.Bar(
-                x=zones_labels,
-                y=ast_df["unast_fg_pct"].tolist(),
-                name="Unassisted FG%",
-                marker_color="#e05c5c",
-                text=[pct_fmt(v) for v in ast_df["unast_fg_pct"]],
-                textposition="outside",
-            )
-        )
-        fig_ast2.update_layout(
+        fig_ast_rate.update_layout(
             template=PLOTLY_TEMPLATE,
-            title="FG% — Assisted vs Unassisted",
-            barmode="group",
+            title="% of Makes Assisted by Zone",
             margin=dict(l=10, r=10, t=35, b=60),
             height=280,
-            yaxis=dict(range=[0, 90], showgrid=True, gridcolor="#2d3150"),
+            yaxis=dict(range=[0, 115], showgrid=True, gridcolor="#2d3150"),
             xaxis=dict(tickangle=-20),
-            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_ast2, use_container_width=True)
+        st.plotly_chart(fig_ast_rate, use_container_width=True)
+
+# ── SECTION 7: 3-Point Context ────────────────────────────────────────────────
+st.markdown(
+    '<div class="section-header">3-Point Context</div>',
+    unsafe_allow_html=True,
+)
+st.caption(
+    "Shooter grades: Red = close hard (37%+ FG3, 3+ att/g), "
+    "Yellow = respect (32–37%), Green = sag off (<32% or low volume)"
+)
+
+ctx = threept_ctx
+if ctx["total_3pt_fga"] > 0:
+    # ── top-line summary metrics ───────────────────────────────────────────
+    tm1, tm2, tm3, tm4 = st.columns(4)
+    with tm1:
+        st.metric("3pt FGA", f"{ctx['total_3pt_fga']:,}")
+    with tm2:
+        st.metric("3pt FG%", pct_fmt(ctx["overall_fg_pct"]))
+    with tm3:
+        st.metric("Corner 3 Rate", pct_fmt(ctx["corner_pct"]))
+    with tm4:
+        st.metric("Ast on Made 3s", pct_fmt(ctx["overall_ast"]))
+
+    st.write("")
+    tp_left, tp_mid, tp_right = st.columns(3)
+
+    # ── location: corner vs above-break ───────────────────────────────────
+    with tp_left:
+        loc_df = ctx["location"]
+        fig_loc = go.Figure()
+        loc_colors = ["#4e9af1", "#a06cf5"]
+        for i, row in loc_df.iterrows():
+            fig_loc.add_trace(go.Bar(
+                x=[row["fga_pct"]],
+                y=[row["zone"]],
+                orientation="h",
+                marker_color=loc_colors[i],
+                showlegend=False,
+                text=[f"{row['fga_pct']:.1f}%  FG%:{pct_fmt(row['fg_pct'])}"],
+                textposition="outside",
+                hovertemplate="%{y}<br>FGA%: %{x:.1f}%<br>FG%: " +
+                              pct_fmt(row['fg_pct']) +
+                              f"<br>Ast on makes: {pct_fmt(row['ast_on_makes'], 0)}<extra></extra>",
+            ))
+        fig_loc.update_layout(
+            template=PLOTLY_TEMPLATE,
+            title="Location",
+            margin=dict(l=10, r=10, t=35, b=10),
+            height=200,
+            xaxis=dict(range=[0, loc_df["fga_pct"].max() + 55], showgrid=False),
+            yaxis=dict(showgrid=False),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_loc, use_container_width=True)
+
+    # ── shooter grade distribution ─────────────────────────────────────────
+    with tp_mid:
+        grade_df = ctx["grade"]
+        fig_grade = go.Figure()
+        for _, row in grade_df.iterrows():
+            c = GRADE_COLORS[row["grade_key"]]
+            fig_grade.add_trace(go.Bar(
+                x=[row["fga_pct"]],
+                y=[row["grade"]],
+                orientation="h",
+                marker_color=c,
+                showlegend=False,
+                text=[f"{row['fga_pct']:.1f}%  (FG%:{pct_fmt(row['fg_pct'])})"],
+                textposition="outside",
+            ))
+        fig_grade.update_layout(
+            template=PLOTLY_TEMPLATE,
+            title="Shooter Grade",
+            margin=dict(l=10, r=10, t=35, b=10),
+            height=200,
+            xaxis=dict(range=[0, grade_df["fga_pct"].max() + 60], showgrid=False),
+            yaxis=dict(
+                categoryorder="array",
+                categoryarray=[GRADE_LABELS[g] for g in reversed(GRADE_ORDER)],
+                showgrid=False,
+            ),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_grade, use_container_width=True)
+
+    # ── clock timing ──────────────────────────────────────────────────────
+    with tp_right:
+        clk_df = ctx["clock"]
+        clk_colors = ["#4ec9b0", "#4e9af1", "#e05c5c", "#e07c40"]
+        fig_clk = go.Figure()
+        for i, row in clk_df.iterrows():
+            fig_clk.add_trace(go.Bar(
+                x=[row["fga_pct"]],
+                y=[row["clock"]],
+                orientation="h",
+                marker_color=clk_colors[i],
+                showlegend=False,
+                text=[f"{row['fga_pct']:.1f}%  (FG%:{pct_fmt(row['fg_pct'])})"],
+                textposition="outside",
+            ))
+        fig_clk.update_layout(
+            template=PLOTLY_TEMPLATE,
+            title="Shot Clock",
+            margin=dict(l=10, r=10, t=35, b=10),
+            height=200,
+            xaxis=dict(range=[0, clk_df["fga_pct"].max() + 60], showgrid=False),
+            yaxis=dict(
+                categoryorder="array",
+                categoryarray=list(reversed([r["clock"] for _, r in clk_df.iterrows()])),
+                showgrid=False,
+            ),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_clk, use_container_width=True)
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("---")

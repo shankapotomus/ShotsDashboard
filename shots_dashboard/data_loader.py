@@ -59,25 +59,50 @@ def _classify_zone(row) -> str:
 
 
 # ── Possession-bucket classification ──────────────────────────────────────────
-def _classify_poss_bucket(ptype: str, shot_num: int, time_since_prev_end: float) -> str:
+def _classify_poss_bucket(
+    ptype: str,
+    shot_num: int,
+    time_since_prev_end: float,
+    time_oreb_to_fga: float,
+    is_last_in_poss: bool,
+) -> str:
     """
-    time_since_prev_end: game-clock seconds elapsed from previous possession's
-    end to this shot.  NaN when unknown (start of period, etc.).
+    shot_num:         cumulative FGA on this offensive trip (cum_fga_in_trip).
+    is_last_in_poss:  True for the terminal shot in this possession_id (the
+                      made bucket or the final miss after all scramble attempts).
+    time_oreb_to_fga: pipeline-computed seconds from OREB to the first FGA in
+                      this possession.  Null (~30% of second_chance shots) means
+                      the pipeline could not determine OREB timing — those fall
+                      through to HC bucketing rather than being mislabeled putbacks.
 
-    The pipeline labels ~50% of possessions as "transition" because it sets
-    start_seconds = shot_seconds for any quick shot, making time_in_poss = 0.
-    We filter this: a possession is only treated as "transition" if the shot
-    was actually taken within 8 s of the previous possession ending.
+    A shot is a true putback only when:
+      - the possession is second_chance / scramble_putback,
+      - torf <= 5 s (quick scramble off the OREB), AND
+      - it is the LAST shot in that possession (is_last_in_poss == True).
+    Only the terminal shot counts so that each OREB opportunity is one scoring
+    attempt.  Intermediate misses in the same scramble window get
+    "scramble_intermediate" and are excluded from all HC FG% buckets (they are
+    structurally guaranteed misses — the possession continued after them).
+    Note: torf is a possession-level field reflecting the first FGA's timing.
+    Multi-shot scrambles where later shots slip past 5 s are rare enough in
+    practice that start_seconds is not a reliable per-shot alternative (it has
+    zero nulls and a wide distribution suggesting unreliable merge matches).
     """
     if ptype in ("second_chance", "scramble_putback"):
-        return "putback"
-    if ptype == "transition":
+        if pd.notna(time_oreb_to_fga) and time_oreb_to_fga <= 5:
+            if is_last_in_poss:
+                return "putback"
+            # Intermediate miss in a multi-shot scramble: structurally cannot be
+            # a make (possession continued), so excluding from all HC FG% buckets
+            # prevents these guaranteed-zero shots from diluting HC efficiency.
+            return "scramble_intermediate"
+        # torf > 5 s or null: offense has reset — fall through to trip-based HC bucketing
+    elif ptype == "transition":
         if pd.notna(time_since_prev_end) and time_since_prev_end <= 8:
             return "transition"
-        # Pipeline mislabeled as transition; treat as first half-court attempt
-        return "first_hc"
-    # half_court (and any other type)
-    if shot_num == 1:
+        # Pipeline mislabeled as transition; fall through to HC bucketing
+    # HC set: bucket by cumulative FGA on this offensive trip
+    if shot_num <= 1:
         return "first_hc"
     if shot_num == 2:
         return "second_hc"
@@ -85,15 +110,20 @@ def _classify_poss_bucket(ptype: str, shot_num: int, time_since_prev_end: float)
 
 
 # ── Shot-clock bucket ─────────────────────────────────────────────────────────
-def _classify_clock_bucket(ptype: str, time_since_prev_end: float) -> str:
+def _classify_clock_bucket(ptype: str, time_since_prev_end: float, time_oreb_to_fga: float) -> str:
     """
-    Uses time_since_prev_end (game clock elapsed from previous possession's end
-    to the shot) as a proxy for shot-clock time used.  This is the only reliable
-    timing measure because for transition possessions the pipeline sets
-    start_seconds = shot_seconds (so time_in_poss is always 0).
+    Uses time_since_prev_end as a shot-clock proxy for transition/half-court shots.
+    For second_chance/scramble_putback uses time_oreb_to_fga (pipeline-computed
+    seconds from OREB to first FGA) which is the correct OREB-timing measure.
+
+    second_chance/scramble_putback shots within 5 s of the OREB → "extra"
+    (putback pace).  Beyond 5 s (or null) the offense has reset, so fall
+    through to normal shot-clock bucketing.
     """
     if ptype in ("second_chance", "scramble_putback"):
-        return "extra"
+        if pd.notna(time_oreb_to_fga) and time_oreb_to_fga <= 5:
+            return "extra"
+        # fell out of scramble window — fall through to normal timing below
     if pd.notna(time_since_prev_end):
         if time_since_prev_end <= 8:
             return "transition_pace"
@@ -149,6 +179,58 @@ def load_all_data():
     shots = shots[shots["shot_range"] != "free_throw"].copy()
     shots["shot_zone"] = shots.apply(_classify_zone, axis=1)
 
+    # is_assisted: True when the shot was credited to an assisting player.
+    # Use assisted_by.notna() rather than the `assisted` boolean — the bool has
+    # only ~21% coverage while assisted_by fires on ~52% of makes (matching the
+    # expected D1 median) and is always null on misses (clean semantics).
+    shots["is_assisted"] = shots["assisted_by"].notna()
+
+    # ── shooter 3pt grade (Red / Yellow / Green closeout priority) ────────────
+    # Grade each shooter by their season 3pt FG% — used in defensive analysis
+    # to assess *who* a team is allowing to shoot 3s, not just how many.
+    #
+    # Qualification: 3+ 3pt attempts per game AND 5+ games played.
+    # Below that volume the sample is too small to trust; treat as Green.
+    #
+    # Thresholds (among qualified shooters, ~top-30th percentile = Red):
+    #   Red    ≥ 37%  — must close hard, genuine 3pt threat
+    #   Yellow  32–37% — close out but stay under control
+    #   Green  < 32%  — can sag; also all low-volume / unqualified shooters
+    _games_played = (
+        shots.groupby("shooter_id")["gameId"]
+        .nunique()
+        .rename("_gp")
+    )
+    _three_stats = (
+        shots[shots["is_three"] == True]
+        .groupby("shooter_id")
+        .agg(_att3=("made", "count"), _made3=("made", "sum"))
+    )
+    _shooter_grades = (
+        _three_stats
+        .join(_games_played, how="left")
+        .assign(
+            _att3_pg=lambda d: d["_att3"] / d["_gp"].clip(lower=1),
+            _fg3=lambda d: 100.0 * d["_made3"] / d["_att3"].clip(lower=1),
+        )
+    )
+    def _grade(row):
+        if row["_att3_pg"] >= 3 and row["_gp"] >= 5:
+            if row["_fg3"] >= 37:
+                return "red"
+            if row["_fg3"] >= 32:
+                return "yellow"
+        return "green"
+
+    _shooter_grades["shooter_3pt_grade"] = _shooter_grades.apply(_grade, axis=1)
+    shots = shots.merge(
+        _shooter_grades[["shooter_3pt_grade"]],
+        left_on="shooter_id",
+        right_index=True,
+        how="left",
+    )
+    shots["shooter_3pt_grade"] = shots["shooter_3pt_grade"].fillna("green")
+
     # ── link shots → possessions ──────────────────────────────────────────────
     shots_enriched = _link_shots_to_possessions(shots, possessions)
 
@@ -202,7 +284,7 @@ def _link_shots_to_possessions(
     poss_cols = [
         "_pgkey",
         "possession_id", "possession_team", "possession_type",
-        "start_seconds", "end_seconds",
+        "start_seconds", "end_seconds", "time_oreb_to_fga",
     ]
 
     merged = pd.merge_asof(
@@ -226,6 +308,10 @@ def _link_shots_to_possessions(
     merged["shot_num_in_poss"] = (
         merged.groupby(["gameId", "possession_id"]).cumcount() + 1
     )
+    # Last shot in each possession: the terminal outcome (made or final miss).
+    # Used for putback classification so each OREB opportunity counts once.
+    poss_size = merged.groupby(["gameId", "possession_id"])["shot_num_in_poss"].transform("max")
+    merged["is_last_in_poss"] = (merged["shot_num_in_poss"] == poss_size)
 
     # ── time since previous possession ended ──────────────────────────────────
     # For "transition" possessions the pipeline sets start_seconds = shot_seconds
@@ -243,6 +329,48 @@ def _link_shots_to_possessions(
 
     merged = merged.merge(poss_prev, on=["gameId", "possession_id"], how="left")
 
+    # ── trip-level cumulative FGA ──────────────────────────────────────────────
+    # Possession-level chaining is unreliable because the pipeline often inserts
+    # an opponent possession record between the missed shot and the OREB, making
+    # the "previous possession" by ID (or clock order) the opponent's.
+    # Instead we track trips at the shot level:
+    #   - A shot whose possession_type is second_chance / scramble_putback
+    #     continues the same offensive trip as the prior FGA by that team.
+    #   - Any other possession_type starts a new trip.
+    # Sorting shots chronologically (descending secondsRemaining = forward in time)
+    # and cumcounting within (gameId, team, trip_id) gives cum_fga_in_trip.
+    merged = merged.sort_values(
+        ["gameId", "period", "team", "secondsRemaining"],
+        ascending=[True, True, True, False],
+    )
+    # Gap (seconds) from the previous same-team shot within the same period.
+    # Used to catch "false" second_chance labels — cases where the pipeline tags
+    # a possession as second_chance but the team's prior shot was a make (so the
+    # opponent had the ball in between).  The CBB shot clock resets to 20s after
+    # an OREB, so any genuine putback/reset shot must arrive within ~30s of the
+    # prior team shot.  A larger gap means at least one full opponent possession
+    # occurred and this should be treated as a new trip.
+    grp = merged.groupby(["gameId", "period", "team"])
+    merged["_prev_sr"]   = grp["secondsRemaining"].shift(1)
+    merged["_prev_made"] = grp["made"].shift(1)
+    merged["_shot_gap"]  = (merged["_prev_sr"] - merged["secondsRemaining"]).clip(lower=0)
+
+    # A possession continues the same trip only when ALL three hold:
+    #   1. Pipeline labels it as a second-chance / scramble continuation
+    #   2. The prior same-team shot was a MISS  (can't get OREB after a make)
+    #   3. The gap from the prior shot is ≤ 30s (rules out a full opponent possession)
+    is_continuation = (
+        merged["possession_type"].isin(["second_chance", "scramble_putback"])
+        & (merged["_prev_made"] == False)
+        & (merged["_shot_gap"] <= 30)
+    )
+    merged["_new_trip"] = (~is_continuation).astype(int)
+    merged["_trip_id"] = merged.groupby(["gameId", "period", "team"])["_new_trip"].cumsum()
+    merged["cum_fga_in_trip"] = (
+        merged.groupby(["gameId", "period", "team", "_trip_id"]).cumcount() + 1
+    )
+    merged.drop(columns=["_new_trip", "_trip_id", "_prev_sr", "_prev_made", "_shot_gap"], inplace=True)
+
     # time_since_prev_end: positive = seconds elapsed since ball changed hands
     merged["time_since_prev_end"] = (
         merged["prev_end_seconds"] - merged["secondsRemaining"]
@@ -250,14 +378,16 @@ def _link_shots_to_possessions(
 
     # ── derived labels (vectorised) ───────────────────────────────────────────
     pt   = merged["possession_type"].fillna("nan").astype(str)
-    sn   = merged["shot_num_in_poss"].fillna(1).astype(int)
+    sn   = merged["cum_fga_in_trip"].fillna(1).astype(int)
     tspe = merged["time_since_prev_end"]
+    torf = merged["time_oreb_to_fga"]
+    ilip = merged["is_last_in_poss"].fillna(False)
 
     merged["poss_bucket"] = [
-        _classify_poss_bucket(p, s, t) for p, s, t in zip(pt, sn, tspe)
+        _classify_poss_bucket(p, s, t, o, n) for p, s, t, o, n in zip(pt, sn, tspe, torf, ilip)
     ]
     merged["clock_bucket"] = [
-        _classify_clock_bucket(p, t) for p, t in zip(pt, tspe)
+        _classify_clock_bucket(p, t, o) for p, t, o in zip(pt, tspe, torf)
     ]
 
     merged.drop(columns=["_gkey", "_pgkey", "prev_end_seconds"], inplace=True, errors="ignore")
