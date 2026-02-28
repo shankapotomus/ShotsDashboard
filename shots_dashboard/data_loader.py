@@ -175,8 +175,9 @@ def load_all_data():
         possessions = possessions.copy()
         possessions.loc[poss_adj.index, "possession_type"] = poss_adj["possession_type"]
 
-    # ── shots: drop FTs, add zone ─────────────────────────────────────────────
-    shots = shots[shots["shot_range"] != "free_throw"].copy()
+    # ── shots: separate FTs (kept for PPP), process FGAs ─────────────────────
+    shots_ft = shots[shots["shot_range"] == "free_throw"].copy()
+    shots    = shots[shots["shot_range"] != "free_throw"].copy()
     shots["shot_zone"] = shots.apply(_classify_zone, axis=1)
 
     # is_assisted: True when the shot was credited to an assisting player.
@@ -233,6 +234,21 @@ def load_all_data():
 
     # ── link shots → possessions ──────────────────────────────────────────────
     shots_enriched = _link_shots_to_possessions(shots, possessions)
+
+    # ── attach FT rows with possession context (for PPP numerator) ───────────
+    # FTs are kept separate from FGAs so trip/bucket logic above is unaffected.
+    # Only possession_type is needed from the join; other derived columns
+    # (poss_bucket, clock_bucket, cum_fga_in_trip) exist but are always ignored
+    # because every metric filters by shot_zone or poss_bucket, and "free_throw"
+    # is not in any of those allow-lists.
+    if not shots_ft.empty and not possessions.empty:
+        shots_ft["shot_zone"]         = "free_throw"
+        shots_ft["is_assisted"]       = False
+        shots_ft["shooter_3pt_grade"] = "green"
+        shots_ft_enriched = _link_shots_to_possessions(shots_ft, possessions)
+        shots_enriched = pd.concat(
+            [shots_enriched, shots_ft_enriched], ignore_index=True
+        )
 
     return shots_enriched, possessions, four_factors, games
 

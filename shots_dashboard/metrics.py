@@ -504,14 +504,16 @@ def compute_poss_type_summary(
     team: str,
     side: str,
     shots: pd.DataFrame | None = None,
+    ff: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Summarise raw possessions (including non-shooting) by possession_type.
 
     Returns: poss_type | poss_type_key | count | share | fg_pct | to_pct | ppp
 
-    ``ppp`` = points per possession from field goals (FTs excluded from shots
-    data).  Requires the enriched shots DataFrame to be passed in.
+    ``ppp`` = total points per possession (FG + FT).  FT points are distributed
+    across possession types proportionally by how often each type ends with
+    raw_outcome == 'made_ft', using total FTM from the four_factors table.
     """
     if poss.empty or games.empty:
         return pd.DataFrame()
@@ -533,7 +535,7 @@ def compute_poss_type_summary(
     df = df[df["possession_type"].isin(_PTYPE_ORDER)]
     total = len(df)
 
-    # ── PPP numerator from shots (2*FGM + made_3, per possession_type) ───────
+    # ── FG points from shots (2*FGM + made_3, per possession_type) ───────────
     pts_by_type: dict[str, float] = {}
     if shots is not None and not shots.empty and "possession_type" in shots.columns:
         tc = "team" if side == "Offense" else "opponent"
@@ -549,14 +551,40 @@ def compute_poss_type_summary(
             .to_dict()
         )
 
+    # ── FT points: distribute total FTM by made_ft frequency per type ────────
+    # FTM is zeroed in ~50% of rows (pipeline issue); estimate using
+    # FTA (always populated) × FT% derived from valid (FTM > 0) rows.
+    ft_pts_by_type: dict[str, float] = {}
+    if ff is not None and not ff.empty:
+        _tc = "team" if side == "Offense" else "opponent"
+        _ff_rows  = ff[ff[_tc] == team]
+        _valid_ft = _ff_rows[_ff_rows["FTM"] > 0]
+        if len(_valid_ft) > 0 and _valid_ft["FTA"].sum() > 0:
+            _ft_pct = _valid_ft["FTM"].sum() / _valid_ft["FTA"].sum()
+            _ftm = float(_ff_rows["FTA"].sum() * _ft_pct)
+        else:
+            _ftm = 0.0
+        if _ftm > 0:
+            _ft_by_type = (
+                df[df["raw_outcome"] == "made_ft"]
+                .groupby("possession_type")
+                .size()
+            )
+            _ft_total = _ft_by_type.sum()
+            if _ft_total > 0:
+                for pt in _PTYPE_ORDER:
+                    ft_pts_by_type[pt] = _ftm * (_ft_by_type.get(pt, 0) / _ft_total)
+
     rows = []
     for pt in _PTYPE_ORDER:
-        sub  = df[df["possession_type"] == pt]
-        n    = len(sub)
-        made = (sub["raw_outcome"] == "made_fg").sum()
-        to   = sub["raw_outcome"].isin(["turnover", "steal"]).sum()
-        pts  = pts_by_type.get(pt, np.nan)
-        ppp  = round(pts / n, 3) if (pd.notna(pts) and n > 0) else np.nan
+        sub    = df[df["possession_type"] == pt]
+        n      = len(sub)
+        made   = (sub["raw_outcome"] == "made_fg").sum()
+        to     = sub["raw_outcome"].isin(["turnover", "steal"]).sum()
+        fg_pts = pts_by_type.get(pt, np.nan)
+        ft_pts = ft_pts_by_type.get(pt, 0.0)
+        total_pts = (fg_pts + ft_pts) if pd.notna(fg_pts) else np.nan
+        ppp = round(total_pts / n, 3) if (pd.notna(total_pts) and n > 0) else np.nan
         rows.append({
             "poss_type":     _PTYPE_LABELS[pt],
             "poss_type_key": pt,
@@ -571,7 +599,8 @@ def compute_poss_type_summary(
 
 # ── League-wide PPP per possession type (for percentile ranking) ──────────────
 def compute_poss_ppp_league(
-    shots: pd.DataFrame, poss: pd.DataFrame, games: pd.DataFrame
+    shots: pd.DataFrame, poss: pd.DataFrame, games: pd.DataFrame,
+    ff: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Vectorised PPP + share per possession type for every D1 team.
@@ -643,13 +672,217 @@ def compute_poss_ppp_league(
             .merge(pts_df, on=["team", "possession_type"], how="left")
             .merge(total_ct, on="team", how="left")
         )
-        combo["pts"]   = combo["pts"].fillna(0)
-        combo["ppp"]   = combo["pts"] / combo["n"]
-        combo["share"] = 100.0 * combo["n"] / combo["total"]
-        combo["side"]  = side
-        dfs.append(combo[["team", "side", "possession_type", "share", "ppp"]])
+        combo["pts"] = combo["pts"].fillna(0)
+
+        # Add FT points: distribute each team's estimated FTM by made_ft frequency per type.
+        # FTM is zeroed in ~50% of rows (pipeline issue); estimate using
+        # FTA (always populated) × per-team FT% from valid (FTM > 0) rows.
+        if ff is not None and not ff.empty:
+            _tc_ff = "team" if side == "Offense" else "opponent"
+            _ff_d1 = ff[ff[_tc_ff].isin(d1_teams)]
+            _valid  = _ff_d1[_ff_d1["FTM"] > 0]
+            _ft_pct_by_team = (
+                _valid.groupby(_tc_ff)
+                .apply(lambda g: g["FTM"].sum() / g["FTA"].sum() if g["FTA"].sum() > 0 else 0.0)
+                .reset_index(name="ft_pct")
+                .rename(columns={_tc_ff: "team"})
+            )
+            _fta_total = (
+                _ff_d1.groupby(_tc_ff)["FTA"].sum()
+                .reset_index()
+                .rename(columns={_tc_ff: "team", "FTA": "fta_total"})
+            )
+            ftm_df = (
+                _fta_total
+                .merge(_ft_pct_by_team, on="team", how="left")
+                .assign(FTM=lambda d: d["fta_total"] * d["ft_pct"].fillna(0))
+                [["team", "FTM"]]
+            )
+            ft_poss_raw = (
+                ps_s[ps_s["raw_outcome"] == "made_ft"]
+                .groupby([ps_grp, "possession_type"])
+                .size()
+                .reset_index(name="ft_n")
+                .rename(columns={ps_grp: "team"})
+            )
+            ft_total_df = (
+                ft_poss_raw.groupby("team")["ft_n"].sum()
+                .reset_index(name="ft_total")
+            )
+            ft_poss_raw = (
+                ft_poss_raw
+                .merge(ft_total_df, on="team")
+                .merge(ftm_df, on="team", how="left")
+            )
+            ft_poss_raw["ft_pts"] = (
+                ft_poss_raw["FTM"].fillna(0)
+                * ft_poss_raw["ft_n"]
+                / ft_poss_raw["ft_total"].clip(lower=1)
+            )
+            combo = combo.merge(
+                ft_poss_raw[["team", "possession_type", "ft_pts"]],
+                on=["team", "possession_type"],
+                how="left",
+            )
+            combo["pts"] = combo["pts"] + combo["ft_pts"].fillna(0)
+            combo.drop(columns=["ft_pts"], inplace=True)
+
+        combo["ppp"]       = combo["pts"] / combo["n"]
+        combo["share"]     = 100.0 * combo["n"] / combo["total"]
+        combo["pts_per100"] = combo["pts"] / combo["total"] * 100
+        combo["side"]      = side
+        dfs.append(combo[["team", "side", "possession_type", "share", "ppp", "pts_per100"]])
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+# ── Last-N games per-possession-type breakdown ────────────────────────────────
+def compute_last5_game_breakdown(
+    poss: pd.DataFrame,
+    games: pd.DataFrame,
+    team: str,
+    side: str,
+    shots: pd.DataFrame | None = None,
+    ff: pd.DataFrame | None = None,
+    n_games: int = 5,
+) -> pd.DataFrame:
+    """
+    Per-game, per-possession-type summary for the team's last n_games.
+
+    Returns DataFrame columns:
+        game_id | game_label | game_order | poss_type_key |
+        pts | count | total_poss | game_ppp | game_pts
+    """
+    if poss.empty or games.empty:
+        return pd.DataFrame()
+
+    team_games = games[
+        (games["homeTeam"] == team) | (games["awayTeam"] == team)
+    ].copy()
+
+    if "startDate" in team_games.columns:
+        team_games = team_games.sort_values("startDate", ascending=True)
+
+    last_n = team_games.tail(n_games).reset_index(drop=True)
+
+    # Pre-compute season FT% for fallback when per-game FTM is zeroed
+    season_ft_pct: float | None = None
+    if ff is not None and not ff.empty and "game_id" in ff.columns:
+        _tc_s = "team" if side == "Offense" else "opponent"
+        _season_rows = ff[ff[_tc_s] == team]
+        _valid_season = _season_rows[_season_rows["FTM"] > 0]
+        if len(_valid_season) > 0 and _valid_season["FTA"].sum() > 0:
+            season_ft_pct = float(
+                _valid_season["FTM"].sum() / _valid_season["FTA"].sum()
+            )
+
+    all_rows: list[dict] = []
+
+    for order, (_, g) in enumerate(last_n.iterrows()):
+        gid = g["id"]
+        is_home = g["homeTeam"] == team
+        opponent = g["awayTeam"] if is_home else g["homeTeam"]
+
+        date_str = ""
+        if "startDate" in g.index and pd.notna(g["startDate"]):
+            try:
+                dt = pd.to_datetime(g["startDate"])
+                date_str = f"{dt.month}/{dt.day}"
+            except Exception:
+                date_str = str(g["startDate"])[:10]
+
+        loc = "H" if is_home else "@"
+        game_label = f"{loc} {date_str}"
+
+        # Filter possessions for this game
+        if side == "Offense":
+            df = poss[(poss["gameId"] == gid) & (poss["possession_team"] == team)]
+        else:
+            df = poss[
+                (poss["gameId"] == gid)
+                & (poss["possession_team"] != team)
+                & (poss["possession_team"].notna())
+            ]
+
+        df = df[df["possession_type"].isin(_PTYPE_ORDER)]
+        total = len(df)
+        if total == 0:
+            continue
+
+        # FG points per possession type for this game
+        pts_by_type: dict[str, float] = {}
+        if shots is not None and not shots.empty and "possession_type" in shots.columns:
+            tc = "team" if side == "Offense" else "opponent"
+            sh = shots[(shots[tc] == team) & (shots["gameId"] == gid)]
+            sh = sh[sh["shot_zone"] != "free_throw"]
+            _pts = sh["made"].astype(int) * 2 + (
+                (sh["is_three"] == True) & (sh["made"] == True)
+            ).astype(int)
+            pts_by_type = (
+                sh.assign(_pts=_pts)
+                .groupby("possession_type")["_pts"]
+                .sum()
+                .to_dict()
+            )
+
+        # FT points for this game, distributed by made_ft frequency per type
+        ft_pts_by_type: dict[str, float] = {}
+        if ff is not None and not ff.empty and "game_id" in ff.columns:
+            _tc = "team" if side == "Offense" else "opponent"
+            _ff_game = ff[(ff["game_id"] == gid) & (ff[_tc] == team)]
+            if not _ff_game.empty:
+                _valid_ft = _ff_game[_ff_game["FTM"] > 0]
+                if len(_valid_ft) > 0 and _valid_ft["FTA"].sum() > 0:
+                    _ft_pct = float(
+                        _valid_ft["FTM"].sum() / _valid_ft["FTA"].sum()
+                    )
+                    _ftm = float(_ff_game["FTA"].sum() * _ft_pct)
+                elif season_ft_pct is not None:
+                    _ftm = float(_ff_game["FTA"].sum() * season_ft_pct)
+                else:
+                    _ftm = 0.0
+
+                if _ftm > 0:
+                    _ft_by_type = (
+                        df[df["raw_outcome"] == "made_ft"]
+                        .groupby("possession_type")
+                        .size()
+                    )
+                    _ft_total = _ft_by_type.sum()
+                    if _ft_total > 0:
+                        for pt in _PTYPE_ORDER:
+                            ft_pts_by_type[pt] = _ftm * (
+                                _ft_by_type.get(pt, 0) / _ft_total
+                            )
+
+        game_total_pts = 0.0
+        game_rows: list[dict] = []
+        for pt in _PTYPE_ORDER:
+            sub = df[df["possession_type"] == pt]
+            n = len(sub)
+            fg_pts = pts_by_type.get(pt, 0.0)
+            ft_pts = ft_pts_by_type.get(pt, 0.0)
+            total_pts = fg_pts + ft_pts
+            game_total_pts += total_pts
+            game_rows.append({
+                "game_id":      gid,
+                "game_label":   game_label,
+                "game_order":   order,
+                "opponent":     opponent,
+                "poss_type_key": pt,
+                "pts":          round(total_pts, 2),
+                "count":        n,
+                "total_poss":   total,
+            })
+
+        game_ppp = round(game_total_pts / total, 2) if total > 0 else np.nan
+        for r in game_rows:
+            r["game_ppp"] = game_ppp
+            r["game_pts"] = round(game_total_pts, 2)
+
+        all_rows.extend(game_rows)
+
+    return pd.DataFrame(all_rows)
 
 
 # ── Directional rules for poss-type percentiles ───────────────────────────────
@@ -664,6 +897,10 @@ _POSS_HIGHER_IS_BETTER: dict[str, dict[str, dict[str, bool]]] = {
     "share": {
         "Offense": {"transition": True,  "half_court": False, "second_chance": True,  "scramble_putback": True},
         "Defense": {"transition": False, "half_court": True,  "second_chance": False, "scramble_putback": False},
+    },
+    "pts_per100": {
+        "Offense": {"transition": True,  "half_court": True,  "second_chance": True,  "scramble_putback": True},
+        "Defense": {"transition": False, "half_court": False, "second_chance": False, "scramble_putback": False},
     },
 }
 

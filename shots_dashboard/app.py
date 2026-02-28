@@ -22,6 +22,7 @@ from metrics import (
     compute_clock_zone_metrics,
     compute_four_factors,
     compute_league_stats,
+    compute_last5_game_breakdown,
     compute_poss_ppp_league,
     compute_poss_type_summary,
     compute_team_conference,
@@ -215,8 +216,8 @@ def _get_league_stats(_shots, _ff, _games):
 
 
 @st.cache_data(show_spinner="Computing possession percentiles…")
-def _get_poss_league_stats(_shots, _poss, _games):
-    return compute_poss_ppp_league(_shots, _poss, _games)
+def _get_poss_league_stats(_shots, _poss, _games, _ff):
+    return compute_poss_ppp_league(_shots, _poss, _games, _ff)
 
 
 @st.cache_data(show_spinner="Loading team info…")
@@ -241,7 +242,7 @@ def _load_team_info():
 
 
 league_stats      = _get_league_stats(shots, four_factors, games)
-poss_league_stats = _get_poss_league_stats(shots, possessions, games)
+poss_league_stats = _get_poss_league_stats(shots, possessions, games, four_factors)
 team_info_df      = _load_team_info()
 
 # ── D1 teams (10+ games) ───────────────────────────────────────────────────────
@@ -322,7 +323,8 @@ zone_df    = compute_zone_metrics(shots, selected_team, side)
 bucket_df  = compute_bucket_metrics(shots, selected_team, side)
 clock_df   = compute_clock_zone_metrics(shots, selected_team, side)
 ast_df     = compute_assisted_metrics(shots, selected_team, side)
-poss_sum   = compute_poss_type_summary(possessions, games, selected_team, side, shots=shots)
+poss_sum   = compute_poss_type_summary(possessions, games, selected_team, side, shots=shots, ff=four_factors)
+last5_df   = compute_last5_game_breakdown(possessions, games, selected_team, side, shots=shots, ff=four_factors)
 threept_ctx = compute_threept_context(shots, selected_team, side)
 
 # ── SECTION 1: Four Factors + Transition ──────────────────────────────────────
@@ -355,7 +357,7 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
     poss_sum["contribution"] = poss_sum["share"] / 100.0 * poss_sum["ppp"].fillna(0)
     overall_ppp = poss_sum["contribution"].sum()
 
-    # ── Stacked PPP bar ───────────────────────────────────────────────────────
+    # ── Stacked PPP bar (season) ───────────────────────────────────────────────
     fig_ppp = go.Figure()
     for _, row in poss_sum.iterrows():
         contrib = row["contribution"]
@@ -367,6 +369,7 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
             orientation="h",
             name=label,
             marker_color=c,
+            showlegend=False,
             text=f"<b>{label}</b><br>{contrib:.2f} pts",
             textposition="inside",
             insidetextanchor="middle",
@@ -378,7 +381,6 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
             ),
         ))
 
-    # Reference line at D1 average (≈1.0) and team total
     fig_ppp.add_vline(x=1.0, line_dash="dash", line_color="#555",
                       annotation_text="Avg", annotation_font_size=10,
                       annotation_position="top")
@@ -386,21 +388,131 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
                       annotation_text=f"{overall_ppp:.2f}",
                       annotation_font_size=10, annotation_position="bottom right")
 
+    fig_ppp.add_annotation(
+        text="<b>Season</b>", x=0.5, y=1, xref="paper", yref="paper",
+        xanchor="center", yanchor="top", showarrow=False,
+        font=dict(size=11, color="#ffffff"),
+    )
     fig_ppp.update_layout(
         template=PLOTLY_TEMPLATE,
         barmode="stack",
         height=110,
-        margin=dict(l=0, r=20, t=8, b=28),
-        xaxis=dict(range=[0.6, 1.4], showgrid=True, gridcolor="#2d3150",
-                   title="Points Per Possession (field goals)", title_font_size=11,
-                   tickvals=[0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]),
+        margin=dict(l=52, r=20, t=14, b=28),
+        xaxis=dict(range=[0, 1.5], showgrid=True, gridcolor="#2d3150",
+                   tickvals=[0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5]),
         yaxis=dict(showticklabels=False, showgrid=False),
-        legend=dict(orientation="h", y=-0.55, x=0.5, xanchor="center",
-                    font_size=11),
+        showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig_ppp, use_container_width=True)
+
+    # ── Last 5 games chart (same PPP scale as season bar) ────────────────────────
+    if not last5_df.empty:
+        ordered_labels = (
+            last5_df.drop_duplicates("game_id")
+            .sort_values("game_order")["game_label"]
+            .tolist()
+        )
+
+        # Convert pts → PPP contribution (pts / total_poss) so scale matches above
+        l5 = last5_df.copy()
+        l5["contrib"] = l5["pts"] / l5["total_poss"]
+
+        game_summary = (
+            l5.drop_duplicates("game_id")
+            .sort_values("game_order")
+        )
+
+        fig_l5 = go.Figure()
+
+        for pt in _PTYPE_ORDER:
+            pt_data = l5[l5["poss_type_key"] == pt].sort_values("game_order").copy()
+            if pt_data.empty:
+                continue
+            c = _PTYPE_COLORS.get(pt, "#9aa0b0")
+            label = _PTYPE_LABELS.get(pt, pt)
+
+            # Per-segment label: pts (poss count) + italic PPP for that type
+            pt_data["seg_ppp"] = (pt_data["pts"] / pt_data["count"].clip(lower=1)).round(2)
+            seg_texts = [
+                f"{row['pts']:.0f} pts ({int(row['count'])} poss)  <i>{row['seg_ppp']:.2f} PPP</i>"
+                for _, row in pt_data.iterrows()
+            ]
+
+            fig_l5.add_trace(go.Bar(
+                x=pt_data["contrib"].tolist(),
+                y=pt_data["game_label"].tolist(),
+                name=label,
+                marker_color=c,
+                orientation="h",
+                showlegend=True,
+                text=seg_texts,
+                textposition="inside",
+                insidetextanchor="middle",
+                textfont=dict(size=8, color="#ffffff"),
+                cliponaxis=False,
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    "PPP contrib: %{x:.2f}<br>"
+                    "Game: %{y}<extra></extra>"
+                ),
+            ))
+
+        # D1 avg and season PPP reference lines (same as season bar)
+        fig_l5.add_vline(x=1.0, line_dash="dash", line_color="#555",
+                         annotation_text="Avg", annotation_font_size=10,
+                         annotation_position="top")
+        fig_l5.add_vline(x=overall_ppp, line_dash="dot", line_color="#9aa0b0",
+                         annotation_text=f"Season {overall_ppp:.2f}",
+                         annotation_font_size=9, annotation_position="bottom right")
+
+        fig_l5.add_annotation(
+            text="<b>Last 5</b>", x=0.5, y=1, xref="paper", yref="paper",
+            xanchor="center", yanchor="top", showarrow=False,
+            font=dict(size=11, color="#ffffff"),
+        )
+
+        # Add opponent logos as layout images on the left side of the y-axis
+        for _, gr in game_summary.iterrows():
+            logo_url = _team_logo_url(gr["opponent"])
+            if logo_url:
+                fig_l5.add_layout_image(
+                    source=logo_url,
+                    x=0,
+                    y=gr["game_label"],
+                    xref="paper",
+                    yref="y",
+                    sizex=0.044,   # ~40 px on a 900 px-wide figure
+                    sizey=0.72,    # 72% of one categorical row height
+                    xanchor="right",
+                    yanchor="middle",
+                    layer="above",
+                )
+
+        fig_l5.update_layout(
+            template=PLOTLY_TEMPLATE,
+            barmode="stack",
+            height=230,
+            margin=dict(l=52, r=30, t=14, b=28),
+            xaxis=dict(
+                range=[0, 1.5],
+                showgrid=True,
+                gridcolor="#2d3150",
+                tickvals=[0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
+            ),
+            yaxis=dict(
+                categoryorder="array",
+                categoryarray=ordered_labels,
+                showgrid=False,
+                showticklabels=False,
+            ),
+            legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center",
+                        font_size=10),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_l5, use_container_width=True)
 
     # ── Table: frequency + PPP with percentiles ───────────────────────────────
     # Header
@@ -426,6 +538,8 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
         + _td("Freq Pctl", bold=True, color="#9aa0b0")
         + _td("PPP", bold=True, color="#9aa0b0")
         + _td("PPP Pctl", bold=True, color="#9aa0b0")
+        + _td("Pts/100", bold=True, color="#9aa0b0")
+        + _td("Pts/100 Pctl", bold=True, color="#9aa0b0")
         + '</tr></thead><tbody>'
     )
 
@@ -435,10 +549,12 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
         c = _PTYPE_COLORS.get(pt_key, "#9aa0b0")
         label = _PTYPE_LABELS.get(pt_key, row["poss_type"])
 
-        freq_pct = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "share")
-        ppp_pct  = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "ppp")
+        freq_pct    = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "share")
+        ppp_pct     = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "ppp")
+        pts100_pct  = poss_percentile_rank(poss_league_stats, selected_team, side, pt_key, "pts_per100")
 
-        ppp_val = f"{row['ppp']:.2f}" if pd.notna(row["ppp"]) else "—"
+        ppp_val    = f"{row['ppp']:.2f}" if pd.notna(row["ppp"]) else "—"
+        pts100_val = f"{row['contribution'] * 100:.2f}" if pd.notna(row["ppp"]) else "—"
 
         body += (
             f'<tr style="border-bottom:1px solid #1e2130;">'
@@ -452,6 +568,8 @@ if not poss_sum.empty and poss_sum["ppp"].notna().any():
             + _td(_pct_badge(freq_pct))
             + _td(ppp_val, color="#e0e4f0", bold=True)
             + _td(_pct_badge(ppp_pct))
+            + _td(pts100_val, color="#e0e4f0", bold=True)
+            + _td(_pct_badge(pts100_pct))
             + '</tr>'
         )
 
